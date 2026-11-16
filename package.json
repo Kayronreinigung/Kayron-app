@@ -1,0 +1,13 @@
+{
+  "name": "kayron-zeiterfassung",
+  "version": "1.0.0",
+  "description": "Arbeitszeiterfassung für Kayron Reinigung",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node --no-warnings server.js"
+  },
+  "engines": {
+    "node": ">=22.5"
+  }
+}

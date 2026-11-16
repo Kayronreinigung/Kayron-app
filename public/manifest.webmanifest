@@ -1,0 +1,12 @@
+{
+  "name": "Kayron Zeiterfassung",
+  "short_name": "Zeiterfassung",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f6f6",
+  "theme_color": "#0f6e6e",
+  "lang": "de",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
