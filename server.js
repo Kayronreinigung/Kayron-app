@@ -77,6 +77,68 @@ CREATE TABLE IF NOT EXISTS photos (
 CREATE INDEX IF NOT EXISTS idx_photos_entry ON photos(entry_id);
 CREATE INDEX IF NOT EXISTS idx_photos_taken ON photos(taken_at);
 
+CREATE TABLE IF NOT EXISTS absences (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  type TEXT NOT NULL,                 -- urlaub, krank, kind_krank, unbezahlt, sonstiges
+  start_date TEXT NOT NULL,           -- 'YYYY-MM-DD'
+  end_date TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'beantragt', -- beantragt, genehmigt, abgelehnt
+  note TEXT NOT NULL DEFAULT '',
+  admin_note TEXT NOT NULL DEFAULT '',
+  certificate INTEGER NOT NULL DEFAULT 0, -- Krankmeldung (AU) liegt vor
+  created_by INTEGER,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  decided_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_absences_user ON absences(user_id, start_date);
+
+CREATE TABLE IF NOT EXISTS issues (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  site_id INTEGER REFERENCES sites(id) ON DELETE SET NULL,
+  category TEXT NOT NULL DEFAULT 'sonstiges',
+  description TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'offen', -- offen, in_bearbeitung, erledigt
+  admin_note TEXT NOT NULL DEFAULT '',
+  lat REAL, lng REAL,
+  offline INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT,
+  resolved_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS site_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  site_id INTEGER REFERENCES sites(id) ON DELETE SET NULL,
+  label TEXT NOT NULL,
+  number TEXT NOT NULL DEFAULT '',
+  notes TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'buero', -- buero, ausgegeben, verloren
+  holder_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  since TEXT,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS key_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  key_id INTEGER NOT NULL REFERENCES site_keys(id) ON DELETE CASCADE,
+  action TEXT NOT NULL,               -- angelegt, ausgabe, rueckgabe, verloren
+  holder_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  at TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT ''
+);
+
+-- Offline-Aktionen, die schon verarbeitet wurden (verhindert doppelte Einträge)
+CREATE TABLE IF NOT EXISTS processed_ops (
+  client_id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  result TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -95,6 +157,12 @@ for (const p of ['start', 'end']) {
 }
 addColumn('sites', 'lat', 'REAL');
 addColumn('sites', 'lng', 'REAL');
+addColumn('entries', 'offline', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('photos', 'issue_id', 'INTEGER');
+addColumn('photos', 'offline', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('users', 'vacation_days', 'REAL NOT NULL DEFAULT 0');
+db.exec('CREATE INDEX IF NOT EXISTS idx_photos_issue ON photos(issue_id)');
+db.prepare("DELETE FROM processed_ops WHERE created_at < datetime('now', '-30 days')").run();
 
 const PHOTO_DIR = path.join(DATA_DIR, 'photos');
 fs.mkdirSync(PHOTO_DIR, { recursive: true });
@@ -167,6 +235,85 @@ function distanceM(lat1, lng1, lat2, lng2) {
   const dLat = (lat2 - lat1) * rad, dLng = (lng2 - lng1) * rad;
   const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLng / 2) ** 2;
   return Math.round(2 * R * Math.asin(Math.sqrt(a)));
+}
+
+// Zeitpunkt einer Aktion: Bei Offline-Aktionen schickt das Handy die echte Uhrzeit mit ('at').
+function clientTime(b) {
+  const now = nowLocal();
+  if (!b || !b.at) return { at: now, offline: 0 };
+  const at = str(b.at, 16);
+  if (!DT_RE.test(at)) throw new HttpError(400, 'Ungültige Zeitangabe');
+  const diff = minutesBetween(at, now); // > 0: liegt in der Vergangenheit
+  if (diff < -10) throw new HttpError(400, 'Die Uhrzeit des Handys liegt in der Zukunft – bitte Uhrzeit prüfen');
+  if (diff > 72 * 60) throw new HttpError(400, 'Offline-Eintrag ist älter als 3 Tage – bitte beim Chef melden');
+  return diff > 2 ? { at, offline: 1 } : { at: now, offline: 0 };
+}
+
+// Führt eine Aktion mit client_id nur einmal aus (wichtig, wenn das Handy offline gespeicherte Aktionen erneut sendet)
+function once(ctx, fn) {
+  const cid = ctx.body && ctx.body.client_id ? str(ctx.body.client_id, 64) : null;
+  if (cid) {
+    const done = db.prepare('SELECT result FROM processed_ops WHERE client_id = ? AND user_id = ?').get(cid, ctx.user.id);
+    if (done) return { ...JSON.parse(done.result || '{}'), duplicate: true };
+  }
+  const result = fn();
+  if (cid) {
+    db.prepare('INSERT OR IGNORE INTO processed_ops (client_id, user_id, result) VALUES (?, ?, ?)')
+      .run(cid, ctx.user.id, JSON.stringify(result && result.id ? { ok: true, id: result.id } : result || { ok: true }));
+  }
+  return result;
+}
+
+// ---- Arbeitstage (Mo–Fr ohne bundesweite Feiertage) ----
+function isoDate(d) { return d.toISOString().slice(0, 10); }
+function addDaysStr(dateStr, n) { const d = new Date(dateStr + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return isoDate(d); }
+const holidayCache = new Map();
+function holidays(y) {
+  if (holidayCache.has(y)) return holidayCache.get(y);
+  // Osterdatum (Gauß/Anonymer Gregorianischer Algorithmus)
+  const a = y % 19, b = Math.floor(y / 100), c = y % 100, d = Math.floor(b / 4), e = b % 4;
+  const f = Math.floor((b + 8) / 25), g = Math.floor((b - f + 1) / 3), h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4), k = c % 4, l = (32 + 2 * e + 2 * i - h - k) % 7, m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const month = Math.floor((h + l - 7 * m + 114) / 31), day = ((h + l - 7 * m + 114) % 31) + 1;
+  const easter = `${y}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  const set = new Set([
+    `${y}-01-01`, addDaysStr(easter, -2), addDaysStr(easter, 1), `${y}-05-01`,
+    addDaysStr(easter, 39), addDaysStr(easter, 50), `${y}-10-03`, `${y}-12-25`, `${y}-12-26`
+  ]);
+  holidayCache.set(y, set);
+  return set;
+}
+function workdays(from, to) {
+  if (!from || !to || from > to) return 0;
+  let n = 0;
+  for (let d = from; d <= to; d = addDaysStr(d, 1)) {
+    const wd = new Date(d + 'T00:00:00Z').getUTCDay();
+    if (wd !== 0 && wd !== 6 && !holidays(Number(d.slice(0, 4))).has(d)) n++;
+  }
+  return n;
+}
+const maxStr = (...a) => a.filter(Boolean).sort().pop();
+const minStr = (...a) => a.filter(Boolean).sort()[0];
+const fmtD = (d) => d.split('-').reverse().join('.');
+
+// ---- Bilder ----
+const IMAGE_TYPES = {
+  jpg: { mime: 'image/jpeg', magic: (b) => b[0] === 0xff && b[1] === 0xd8 },
+  png: { mime: 'image/png', magic: (b) => b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47 },
+  webp: { mime: 'image/webp', magic: (b) => b.slice(0, 4).toString() === 'RIFF' && b.slice(8, 12).toString() === 'WEBP' }
+};
+function decodeImage(dataUrl) {
+  const m = /^data:image\/(jpeg|png|webp);base64,(.+)$/s.exec(String(dataUrl || ''));
+  if (!m) throw new HttpError(400, 'Bitte ein Bild (JPG, PNG oder WebP) auswählen');
+  const ext = m[1] === 'jpeg' ? 'jpg' : m[1];
+  const buf = Buffer.from(m[2], 'base64');
+  if (buf.length < 100 || !IMAGE_TYPES[ext].magic(buf)) throw new HttpError(400, 'Ungültige Bilddatei');
+  return { buf, ext };
+}
+function savePhotoFile({ buf, ext }) {
+  const filename = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}.${ext}`;
+  fs.writeFileSync(path.join(PHOTO_DIR, filename), buf);
+  return filename;
 }
 
 function publicUser(u) {
@@ -311,7 +458,8 @@ route('PUT', '/api/settings', (ctx) => {
 
 // ----- Mitarbeiter -----
 route('GET', '/api/users', () =>
-  db.prepare('SELECT * FROM users ORDER BY active DESC, name COLLATE NOCASE').all().map(publicUser),
+  db.prepare(`SELECT u.*, (SELECT COUNT(*) FROM site_keys k WHERE k.holder_id = u.id AND k.status = 'ausgegeben') AS keys_held
+    FROM users u ORDER BY u.active DESC, u.name COLLATE NOCASE`).all().map(publicUser),
 { auth: 'admin' });
 
 function userFields(b) {
@@ -324,6 +472,7 @@ function userFields(b) {
     hourly_rate: Math.max(0, num(b.hourly_rate)),
     employment_type: types.includes(b.employment_type) ? b.employment_type : 'minijob',
     phone: str(b.phone, 50),
+    vacation_days: Math.max(0, Math.min(365, num(b.vacation_days))),
     active: b.active === false || b.active === 0 ? 0 : 1
   };
 }
@@ -334,8 +483,8 @@ route('POST', '/api/users', (ctx) => {
   if (!f.name || !f.username) throw new HttpError(400, 'Name und Benutzername erforderlich');
   if (pw.length < 4) throw new HttpError(400, 'Passwort/PIN muss mindestens 4 Zeichen haben');
   try {
-    const r = db.prepare(`INSERT INTO users (name, username, password_hash, role, hourly_rate, employment_type, phone, active)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(f.name, f.username, hashPassword(pw), f.role, f.hourly_rate, f.employment_type, f.phone, f.active);
+    const r = db.prepare(`INSERT INTO users (name, username, password_hash, role, hourly_rate, employment_type, phone, active, vacation_days)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(f.name, f.username, hashPassword(pw), f.role, f.hourly_rate, f.employment_type, f.phone, f.active, f.vacation_days);
     return publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(Number(r.lastInsertRowid)));
   } catch (e) {
     if (String(e.message).includes('UNIQUE')) throw new HttpError(400, 'Benutzername ist bereits vergeben');
@@ -353,8 +502,8 @@ route('PUT', '/api/users/:id', (ctx) => {
     throw new HttpError(400, 'Du kannst dir selbst die Admin-Rechte nicht entziehen oder dich deaktivieren');
   }
   try {
-    db.prepare(`UPDATE users SET name=?, username=?, role=?, hourly_rate=?, employment_type=?, phone=?, active=? WHERE id=?`)
-      .run(f.name, f.username, f.role, f.hourly_rate, f.employment_type, f.phone, f.active, id);
+    db.prepare(`UPDATE users SET name=?, username=?, role=?, hourly_rate=?, employment_type=?, phone=?, active=?, vacation_days=? WHERE id=?`)
+      .run(f.name, f.username, f.role, f.hourly_rate, f.employment_type, f.phone, f.active, f.vacation_days, id);
   } catch (e) {
     if (String(e.message).includes('UNIQUE')) throw new HttpError(400, 'Benutzername ist bereits vergeben');
     throw e;
@@ -521,29 +670,33 @@ route('GET', '/api/clock', (ctx) => {
   };
 });
 
-route('POST', '/api/clock/in', (ctx) => {
-  if (runningEntry(ctx.user.id)) throw new HttpError(400, 'Du bist bereits eingestempelt');
+route('POST', '/api/clock/in', (ctx) => once(ctx, () => {
+  const { at, offline } = clientTime(ctx.body);
+  const running = runningEntry(ctx.user.id);
+  if (running) throw new HttpError(400, `Du bist bereits eingestempelt (seit ${fmtD(running.start.slice(0, 10))} ${running.start.slice(11)})`);
   const siteId = ctx.body.site_id ? Number(ctx.body.site_id) : null;
-  if (siteId && !db.prepare('SELECT 1 FROM sites WHERE id = ? AND active = 1').get(siteId)) throw new HttpError(400, 'Objekt nicht gefunden');
+  if (siteId && !db.prepare('SELECT 1 FROM sites WHERE id = ?').get(siteId)) throw new HttpError(400, 'Objekt nicht gefunden');
   const loc = parseLocation(ctx.body.location);
-  db.prepare(`INSERT INTO entries (user_id, site_id, start, note, source, start_lat, start_lng, start_acc)
-    VALUES (?, ?, ?, ?, 'clock', ?, ?, ?)`)
-    .run(ctx.user.id, siteId, nowLocal(), str(ctx.body.note, 1000), loc?.lat ?? null, loc?.lng ?? null, loc?.accuracy ?? null);
-  return { ok: true };
-});
+  const r = db.prepare(`INSERT INTO entries (user_id, site_id, start, note, source, start_lat, start_lng, start_acc, offline)
+    VALUES (?, ?, ?, ?, 'clock', ?, ?, ?, ?)`)
+    .run(ctx.user.id, siteId, at, str(ctx.body.note, 1000), loc?.lat ?? null, loc?.lng ?? null, loc?.accuracy ?? null, offline);
+  return { ok: true, id: Number(r.lastInsertRowid), at };
+}));
 
-route('POST', '/api/clock/out', (ctx) => {
+route('POST', '/api/clock/out', (ctx) => once(ctx, () => {
+  const { at, offline } = clientTime(ctx.body);
   const r = runningEntry(ctx.user.id);
   if (!r) throw new HttpError(400, 'Du bist nicht eingestempelt');
-  const end = nowLocal();
+  const end = at < r.start ? r.start : at;
   const dur = Math.max(0, minutesBetween(r.start, end));
   const brk = Math.min(Math.max(0, Math.round(num(ctx.body.break_minutes))), dur);
   const note = ctx.body.note !== undefined ? str(ctx.body.note, 1000) : r.note;
   const loc = parseLocation(ctx.body.location);
-  db.prepare(`UPDATE entries SET end=?, break_minutes=?, note=?, end_lat=?, end_lng=?, end_acc=?, updated_at=datetime('now') WHERE id=?`)
-    .run(end, brk, note, loc?.lat ?? null, loc?.lng ?? null, loc?.accuracy ?? null, r.id);
-  return { ok: true };
-});
+  db.prepare(`UPDATE entries SET end=?, break_minutes=?, note=?, end_lat=?, end_lng=?, end_acc=?,
+      offline = MAX(offline, ?), updated_at=datetime('now') WHERE id=?`)
+    .run(end, brk, note, loc?.lat ?? null, loc?.lng ?? null, loc?.accuracy ?? null, offline, r.id);
+  return { ok: true, id: r.id, at: end };
+}));
 
 // Admin: Mitarbeiter auf Abstand ausstempeln (z.B. vergessen)
 route('POST', '/api/entries/:id/stop', (ctx) => {
@@ -556,12 +709,13 @@ route('POST', '/api/entries/:id/stop', (ctx) => {
 
 // ----- Fotos (Nachweis der Reinigung) -----
 const PHOTO_SELECT = `
-  SELECT p.id, p.entry_id, p.user_id, p.site_id, p.note, p.lat, p.lng, p.accuracy, p.taken_at,
+  SELECT p.id, p.entry_id, p.issue_id, p.user_id, p.site_id, p.note, p.lat, p.lng, p.accuracy, p.taken_at, p.offline,
     u.name AS user_name, s.name AS site_name
   FROM photos p JOIN users u ON u.id = p.user_id LEFT JOIN sites s ON s.id = p.site_id`;
 
-function queryPhotos({ from, to, userId, siteId, entryId, limit }) {
+function queryPhotos({ from, to, userId, siteId, entryId, issueId, limit }) {
   const where = [], args = [];
+  if (issueId) { where.push('p.issue_id = ?'); args.push(issueId); } else where.push('p.issue_id IS NULL');
   if (from) { where.push('p.taken_at >= ?'); args.push(from + 'T00:00'); }
   if (to) { where.push('p.taken_at <= ?'); args.push(to + 'T23:59'); }
   if (userId) { where.push('p.user_id = ?'); args.push(userId); }
@@ -577,12 +731,6 @@ function deletePhoto(p) {
   db.prepare('DELETE FROM photos WHERE id = ?').run(p.id);
 }
 
-const IMAGE_TYPES = {
-  jpg: { mime: 'image/jpeg', magic: (b) => b[0] === 0xff && b[1] === 0xd8 },
-  png: { mime: 'image/png', magic: (b) => b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47 },
-  webp: { mime: 'image/webp', magic: (b) => b.slice(0, 4).toString() === 'RIFF' && b.slice(8, 12).toString() === 'WEBP' }
-};
-
 route('GET', '/api/photos', (ctx) => {
   const f = entryFilters(ctx);
   const entryId = ctx.query.get('entry_id') ? Number(ctx.query.get('entry_id')) : null;
@@ -590,36 +738,33 @@ route('GET', '/api/photos', (ctx) => {
   return queryPhotos({ ...f, entryId, limit });
 });
 
-route('POST', '/api/photos', (ctx) => {
+route('POST', '/api/photos', (ctx) => once(ctx, () => {
   const b = ctx.body;
-  const m = /^data:image\/(jpeg|png|webp);base64,(.+)$/s.exec(String(b.image || ''));
-  if (!m) throw new HttpError(400, 'Bitte ein Bild (JPG, PNG oder WebP) auswählen');
-  const ext = m[1] === 'jpeg' ? 'jpg' : m[1];
-  const buf = Buffer.from(m[2], 'base64');
-  if (buf.length < 100 || !IMAGE_TYPES[ext].magic(buf)) throw new HttpError(400, 'Ungültige Bilddatei');
+  const img = decodeImage(b.image);
+  const { at, offline } = clientTime(b);
 
-  // Eintrag zuordnen: angegebener Eintrag, sonst laufender, sonst letzter Eintrag von heute
+  // Eintrag zuordnen: angegebener Eintrag, sonst der Einsatz zum Aufnahmezeitpunkt, sonst letzter Eintrag des Tages
   let entry = null;
   if (b.entry_id) {
     entry = db.prepare('SELECT * FROM entries WHERE id = ?').get(Number(b.entry_id));
     if (!entry) throw new HttpError(404, 'Eintrag nicht gefunden');
     if (ctx.user.role !== 'admin' && entry.user_id !== ctx.user.id) throw new HttpError(403, 'Keine Berechtigung');
   } else {
-    entry = runningEntry(ctx.user.id) ||
-      db.prepare('SELECT * FROM entries WHERE user_id = ? AND start >= ? ORDER BY start DESC LIMIT 1')
-        .get(ctx.user.id, nowLocal().slice(0, 10) + 'T00:00');
+    entry = db.prepare(`SELECT * FROM entries WHERE user_id = ? AND start <= ? AND (end IS NULL OR end >= ?)
+        ORDER BY start DESC LIMIT 1`).get(ctx.user.id, at, at) ||
+      db.prepare('SELECT * FROM entries WHERE user_id = ? AND start >= ? AND start <= ? ORDER BY start DESC LIMIT 1')
+        .get(ctx.user.id, at.slice(0, 10) + 'T00:00', at.slice(0, 10) + 'T23:59');
   }
   if (!entry && ctx.user.role !== 'admin') throw new HttpError(400, 'Bitte zuerst einstempeln, dann Fotos hochladen');
 
-  const filename = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}.${ext}`;
-  fs.writeFileSync(path.join(PHOTO_DIR, filename), buf);
+  const filename = savePhotoFile(img);
   const loc = parseLocation(b.location);
-  const r = db.prepare(`INSERT INTO photos (entry_id, user_id, site_id, filename, note, lat, lng, accuracy, taken_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+  const r = db.prepare(`INSERT INTO photos (entry_id, user_id, site_id, filename, note, lat, lng, accuracy, taken_at, offline)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
     entry ? entry.id : null, entry ? entry.user_id : ctx.user.id, entry ? entry.site_id : null,
-    filename, str(b.note, 300), loc?.lat ?? null, loc?.lng ?? null, loc?.accuracy ?? null, nowLocal());
+    filename, str(b.note, 300), loc?.lat ?? null, loc?.lng ?? null, loc?.accuracy ?? null, at, offline);
   return db.prepare(PHOTO_SELECT + ' WHERE p.id = ?').get(Number(r.lastInsertRowid));
-}, { bodyLimit: 15_000_000 });
+}), { bodyLimit: 15_000_000 });
 
 route('GET', '/api/photos/:id/file', (ctx) => {
   const p = db.prepare('SELECT * FROM photos WHERE id = ?').get(Number(ctx.params.id));
@@ -648,6 +793,275 @@ route('DELETE', '/api/photos/:id', (ctx) => {
   return { ok: true };
 });
 
+// ----- Abwesenheiten (Urlaub, Krankheit) -----
+const ABSENCE_TYPES = ['urlaub', 'krank', 'kind_krank', 'unbezahlt', 'sonstiges'];
+const ABSENCE_STATUS = ['beantragt', 'genehmigt', 'abgelehnt'];
+const SICK_TYPES = ['krank', 'kind_krank'];
+const ABSENCE_SELECT = 'SELECT a.*, u.name AS user_name FROM absences a JOIN users u ON u.id = a.user_id';
+
+function decorateAbsence(a) { return { ...a, days: workdays(a.start_date, a.end_date) }; }
+
+// Abwesenheiten, die den Zeitraum berühren (ohne abgelehnte), mit Arbeitstagen innerhalb des Zeitraums
+function absencesIn(userId, from, to) {
+  const where = ['a.start_date <= ?', 'a.end_date >= ?', "a.status != 'abgelehnt'"], args = [to, from];
+  if (userId) { where.push('a.user_id = ?'); args.push(userId); }
+  return db.prepare(ABSENCE_SELECT + ' WHERE ' + where.join(' AND ') + ' ORDER BY a.start_date').all(...args)
+    .map((a) => ({ ...decorateAbsence(a), daysInRange: workdays(maxStr(a.start_date, from), minStr(a.end_date, to)) }));
+}
+function absenceDays(userId, types, from, to) {
+  return absencesIn(userId, from, to).filter((a) => types.includes(a.type) && a.status === 'genehmigt')
+    .reduce((s, a) => s + a.daysInRange, 0);
+}
+
+function validateAbsence(b) {
+  const type = ABSENCE_TYPES.includes(b.type) ? b.type : null;
+  if (!type) throw new HttpError(400, 'Bitte Art der Abwesenheit wählen');
+  const start = str(b.start_date, 10), end = str(b.end_date || b.start_date, 10);
+  if (!DATE_RE.test(start) || !DATE_RE.test(end)) throw new HttpError(400, 'Bitte gültige Daten angeben');
+  if (end < start) throw new HttpError(400, 'Das Ende liegt vor dem Beginn');
+  if (addDaysStr(start, 366) < end) throw new HttpError(400, 'Zeitraum ist zu lang (max. 1 Jahr)');
+  return { type, start_date: start, end_date: end, note: str(b.note, 1000) };
+}
+function checkAbsenceOverlap(userId, start, end, excludeId = 0) {
+  const o = db.prepare(`SELECT * FROM absences WHERE user_id = ? AND status != 'abgelehnt'
+    AND start_date <= ? AND end_date >= ? AND id != ?`).get(userId, end, start, excludeId);
+  if (o) throw new HttpError(400, `Überschneidet sich mit einer bestehenden Abwesenheit (${fmtD(o.start_date)} – ${fmtD(o.end_date)})`);
+}
+
+route('GET', '/api/workdays', (ctx) => {
+  const from = ctx.query.get('from'), to = ctx.query.get('to') || from;
+  if (!DATE_RE.test(from || '') || !DATE_RE.test(to || '')) throw new HttpError(400, 'Datum fehlt');
+  return { days: workdays(from, to) };
+});
+
+route('GET', '/api/absences', (ctx) => {
+  const q = ctx.query, where = [], args = [];
+  let userId = q.get('user_id') ? Number(q.get('user_id')) : null;
+  if (ctx.user.role !== 'admin') userId = ctx.user.id;
+  if (userId) { where.push('a.user_id = ?'); args.push(userId); }
+  if (DATE_RE.test(q.get('from') || '')) { where.push('a.end_date >= ?'); args.push(q.get('from')); }
+  if (DATE_RE.test(q.get('to') || '')) { where.push('a.start_date <= ?'); args.push(q.get('to')); }
+  if (ABSENCE_STATUS.includes(q.get('status'))) { where.push('a.status = ?'); args.push(q.get('status')); }
+  if (ABSENCE_TYPES.includes(q.get('type'))) { where.push('a.type = ?'); args.push(q.get('type')); }
+  return db.prepare(ABSENCE_SELECT + (where.length ? ' WHERE ' + where.join(' AND ') : '') +
+    ' ORDER BY a.start_date DESC').all(...args).map(decorateAbsence);
+});
+
+route('POST', '/api/absences', (ctx) => {
+  const isAdmin = ctx.user.role === 'admin';
+  const userId = isAdmin && ctx.body.user_id ? Number(ctx.body.user_id) : ctx.user.id;
+  if (!db.prepare('SELECT 1 FROM users WHERE id = ?').get(userId)) throw new HttpError(400, 'Mitarbeiter nicht gefunden');
+  const f = validateAbsence(ctx.body);
+  let status;
+  if (isAdmin) status = ABSENCE_STATUS.includes(ctx.body.status) ? ctx.body.status : 'genehmigt';
+  else status = SICK_TYPES.includes(f.type) ? 'genehmigt' : 'beantragt'; // Krankmeldungen gelten sofort
+  if (status !== 'abgelehnt') checkAbsenceOverlap(userId, f.start_date, f.end_date);
+  const r = db.prepare(`INSERT INTO absences (user_id, type, start_date, end_date, status, note, admin_note, certificate, created_by, decided_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(userId, f.type, f.start_date, f.end_date, status, f.note,
+    isAdmin ? str(ctx.body.admin_note, 1000) : '', isAdmin && ctx.body.certificate ? 1 : 0, ctx.user.id,
+    isAdmin ? nowLocal() : null);
+  return decorateAbsence(db.prepare(ABSENCE_SELECT + ' WHERE a.id = ?').get(Number(r.lastInsertRowid)));
+});
+
+route('PUT', '/api/absences/:id', (ctx) => {
+  const id = Number(ctx.params.id);
+  const existing = db.prepare('SELECT * FROM absences WHERE id = ?').get(id);
+  if (!existing) throw new HttpError(404, 'Abwesenheit nicht gefunden');
+  const merged = { ...existing, ...ctx.body };
+  const f = validateAbsence(merged);
+  const status = ABSENCE_STATUS.includes(merged.status) ? merged.status : existing.status;
+  const userId = Number(merged.user_id);
+  if (status !== 'abgelehnt') checkAbsenceOverlap(userId, f.start_date, f.end_date, id);
+  db.prepare(`UPDATE absences SET user_id=?, type=?, start_date=?, end_date=?, status=?, note=?, admin_note=?, certificate=?,
+      decided_at = CASE WHEN status != ? THEN ? ELSE decided_at END WHERE id=?`)
+    .run(userId, f.type, f.start_date, f.end_date, status, f.note, str(merged.admin_note, 1000),
+      merged.certificate === true || merged.certificate === 1 ? 1 : 0, status, nowLocal(), id);
+  return decorateAbsence(db.prepare(ABSENCE_SELECT + ' WHERE a.id = ?').get(id));
+}, { auth: 'admin' });
+
+route('DELETE', '/api/absences/:id', (ctx) => {
+  const a = db.prepare('SELECT * FROM absences WHERE id = ?').get(Number(ctx.params.id));
+  if (!a) throw new HttpError(404, 'Abwesenheit nicht gefunden');
+  if (ctx.user.role !== 'admin' && (a.user_id !== ctx.user.id || a.status !== 'beantragt')) {
+    throw new HttpError(403, 'Nur offene Anträge können zurückgezogen werden');
+  }
+  db.prepare('DELETE FROM absences WHERE id = ?').run(a.id);
+  return { ok: true };
+});
+
+// Urlaubskonto pro Jahr
+route('GET', '/api/absences/summary', (ctx) => {
+  const today = nowLocal().slice(0, 10);
+  const y = Number(ctx.query.get('year')) || Number(today.slice(0, 4));
+  const from = `${y}-01-01`, to = `${y}-12-31`, tomorrow = addDaysStr(today, 1);
+  const users = ctx.user.role === 'admin'
+    ? db.prepare(`SELECT * FROM users WHERE active = 1 OR id IN (SELECT user_id FROM absences WHERE start_date <= ? AND end_date >= ?)
+        ORDER BY name COLLATE NOCASE`).all(to, from)
+    : [ctx.user];
+  return users.map((u) => {
+    const list = absencesIn(u.id, from, to);
+    const vac = list.filter((a) => a.type === 'urlaub');
+    const approved = vac.filter((a) => a.status === 'genehmigt');
+    const taken = approved.reduce((s, a) => s + workdays(maxStr(a.start_date, from), minStr(a.end_date, to, today)), 0);
+    const planned = approved.reduce((s, a) => s + workdays(maxStr(a.start_date, from, tomorrow), minStr(a.end_date, to)), 0);
+    const requested = vac.filter((a) => a.status === 'beantragt').reduce((s, a) => s + a.daysInRange, 0);
+    const sick = list.filter((a) => SICK_TYPES.includes(a.type) && a.status === 'genehmigt').reduce((s, a) => s + a.daysInRange, 0);
+    return {
+      user_id: u.id, name: u.name, entitlement: u.vacation_days || 0, taken, planned, requested,
+      remaining: (u.vacation_days || 0) - taken - planned, sick
+    };
+  });
+});
+
+// ----- Meldungen (Mängel, fehlendes Material, Schäden) -----
+const ISSUE_CATEGORIES = ['defekt', 'material', 'schaden', 'verschmutzung', 'schluessel', 'sonstiges'];
+const ISSUE_STATUS = ['offen', 'in_bearbeitung', 'erledigt'];
+const ISSUE_SELECT = `SELECT i.*, u.name AS user_name, s.name AS site_name, s.address AS site_address
+  FROM issues i JOIN users u ON u.id = i.user_id LEFT JOIN sites s ON s.id = i.site_id`;
+
+function decorateIssue(i) {
+  return { ...i, photos: queryPhotos({ issueId: i.id }).reverse() };
+}
+
+route('GET', '/api/issues', (ctx) => {
+  const q = ctx.query, where = [], args = [];
+  if (ctx.user.role !== 'admin') { where.push('i.user_id = ?'); args.push(ctx.user.id); }
+  const st = q.get('status');
+  if (st === 'aktiv') where.push("i.status != 'erledigt'");
+  else if (ISSUE_STATUS.includes(st)) { where.push('i.status = ?'); args.push(st); }
+  if (q.get('site_id')) { where.push('i.site_id = ?'); args.push(Number(q.get('site_id'))); }
+  const limit = Math.min(500, Number(q.get('limit')) || 200);
+  return db.prepare(ISSUE_SELECT + (where.length ? ' WHERE ' + where.join(' AND ') : '') +
+    ` ORDER BY i.created_at DESC, i.id DESC LIMIT ${limit}`).all(...args).map(decorateIssue);
+});
+
+route('POST', '/api/issues', (ctx) => once(ctx, () => {
+  const b = ctx.body;
+  const { at, offline } = clientTime(b);
+  const category = ISSUE_CATEGORIES.includes(b.category) ? b.category : 'sonstiges';
+  const description = str(b.description, 2000);
+  const images = Array.isArray(b.images) ? b.images.slice(0, 6).map(decodeImage) : [];
+  if (!description && !images.length) throw new HttpError(400, 'Bitte beschreiben, was los ist, oder ein Foto anhängen');
+  const siteId = b.site_id ? Number(b.site_id) : null;
+  if (siteId && !db.prepare('SELECT 1 FROM sites WHERE id = ?').get(siteId)) throw new HttpError(400, 'Objekt nicht gefunden');
+  const loc = parseLocation(b.location);
+  const r = db.prepare(`INSERT INTO issues (user_id, site_id, category, description, lat, lng, offline, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(ctx.user.id, siteId, category, description, loc?.lat ?? null, loc?.lng ?? null, offline, at);
+  const issueId = Number(r.lastInsertRowid);
+  for (const img of images) {
+    db.prepare(`INSERT INTO photos (issue_id, user_id, site_id, filename, note, lat, lng, accuracy, taken_at, offline)
+      VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?)`).run(issueId, ctx.user.id, siteId, savePhotoFile(img),
+      loc?.lat ?? null, loc?.lng ?? null, loc?.accuracy ?? null, at, offline);
+  }
+  return decorateIssue(db.prepare(ISSUE_SELECT + ' WHERE i.id = ?').get(issueId));
+}), { bodyLimit: 40_000_000 });
+
+route('PUT', '/api/issues/:id', (ctx) => {
+  const id = Number(ctx.params.id);
+  const i = db.prepare('SELECT * FROM issues WHERE id = ?').get(id);
+  if (!i) throw new HttpError(404, 'Meldung nicht gefunden');
+  const status = ISSUE_STATUS.includes(ctx.body.status) ? ctx.body.status : i.status;
+  const note = ctx.body.admin_note !== undefined ? str(ctx.body.admin_note, 2000) : i.admin_note;
+  const resolved = status === 'erledigt' ? (i.resolved_at || nowLocal()) : null;
+  db.prepare("UPDATE issues SET status=?, admin_note=?, resolved_at=?, updated_at=? WHERE id=?").run(status, note, resolved, nowLocal(), id);
+  return decorateIssue(db.prepare(ISSUE_SELECT + ' WHERE i.id = ?').get(id));
+}, { auth: 'admin' });
+
+route('DELETE', '/api/issues/:id', (ctx) => {
+  const id = Number(ctx.params.id);
+  for (const p of db.prepare('SELECT * FROM photos WHERE issue_id = ?').all(id)) deletePhoto(p);
+  db.prepare('DELETE FROM issues WHERE id = ?').run(id);
+  return { ok: true };
+}, { auth: 'admin' });
+
+// ----- Schlüsselverwaltung -----
+const KEY_SELECT = `SELECT k.*, s.name AS site_name, u.name AS holder_name
+  FROM site_keys k LEFT JOIN sites s ON s.id = k.site_id LEFT JOIN users u ON u.id = k.holder_id`;
+function keyEvent(keyId, action, holderId, byId, note) {
+  db.prepare('INSERT INTO key_events (key_id, action, holder_id, by_user_id, at, note) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(keyId, action, holderId || null, byId || null, nowLocal(), str(note, 500));
+}
+function getKey(id) {
+  const k = db.prepare(KEY_SELECT + ' WHERE k.id = ?').get(Number(id));
+  if (!k) throw new HttpError(404, 'Schlüssel nicht gefunden');
+  return k;
+}
+function keyFields(b) {
+  const label = str(b.label, 150);
+  if (!label) throw new HttpError(400, 'Bitte eine Bezeichnung angeben (z. B. „Haupteingang“)');
+  const siteId = b.site_id ? Number(b.site_id) : null;
+  if (siteId && !db.prepare('SELECT 1 FROM sites WHERE id = ?').get(siteId)) throw new HttpError(400, 'Objekt nicht gefunden');
+  return { label, number: str(b.number, 100), notes: str(b.notes, 1000), site_id: siteId, active: b.active === false || b.active === 0 ? 0 : 1 };
+}
+
+route('GET', '/api/keys', () => db.prepare(KEY_SELECT + ' ORDER BY k.active DESC, s.name COLLATE NOCASE, k.label COLLATE NOCASE').all(), { auth: 'admin' });
+route('GET', '/api/keys/mine', (ctx) => db.prepare(KEY_SELECT + " WHERE k.holder_id = ? AND k.status = 'ausgegeben' ORDER BY s.name, k.label").all(ctx.user.id));
+
+route('POST', '/api/keys', (ctx) => {
+  const f = keyFields(ctx.body);
+  const r = db.prepare('INSERT INTO site_keys (site_id, label, number, notes, active, since) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(f.site_id, f.label, f.number, f.notes, f.active, nowLocal());
+  const id = Number(r.lastInsertRowid);
+  keyEvent(id, 'angelegt', null, ctx.user.id, '');
+  return getKey(id);
+}, { auth: 'admin' });
+
+route('PUT', '/api/keys/:id', (ctx) => {
+  const k = getKey(ctx.params.id);
+  const f = keyFields({ ...k, ...ctx.body });
+  db.prepare('UPDATE site_keys SET site_id=?, label=?, number=?, notes=?, active=? WHERE id=?')
+    .run(f.site_id, f.label, f.number, f.notes, f.active, k.id);
+  return getKey(k.id);
+}, { auth: 'admin' });
+
+route('DELETE', '/api/keys/:id', (ctx) => {
+  const k = getKey(ctx.params.id);
+  if (k.status === 'ausgegeben') throw new HttpError(400, 'Schlüssel ist noch ausgegeben – bitte erst zurücknehmen');
+  db.prepare('DELETE FROM site_keys WHERE id = ?').run(k.id);
+  return { ok: true };
+}, { auth: 'admin' });
+
+route('POST', '/api/keys/:id/handout', (ctx) => {
+  const k = getKey(ctx.params.id);
+  const userId = Number(ctx.body.user_id);
+  const u = db.prepare('SELECT * FROM users WHERE id = ? AND active = 1').get(userId);
+  if (!u) throw new HttpError(400, 'Bitte einen aktiven Mitarbeiter wählen');
+  if (k.status === 'ausgegeben' && k.holder_id === userId) throw new HttpError(400, `${u.name} hat den Schlüssel bereits`);
+  if (k.status === 'ausgegeben') keyEvent(k.id, 'rueckgabe', k.holder_id, ctx.user.id, 'Weitergabe an ' + u.name);
+  db.prepare("UPDATE site_keys SET status='ausgegeben', holder_id=?, since=? WHERE id=?").run(userId, nowLocal(), k.id);
+  keyEvent(k.id, 'ausgabe', userId, ctx.user.id, ctx.body.note);
+  return getKey(k.id);
+}, { auth: 'admin' });
+
+route('POST', '/api/keys/:id/return', (ctx) => {
+  const k = getKey(ctx.params.id);
+  if (k.status === 'buero') throw new HttpError(400, 'Schlüssel ist bereits im Büro');
+  db.prepare("UPDATE site_keys SET status='buero', holder_id=NULL, since=? WHERE id=?").run(nowLocal(), k.id);
+  keyEvent(k.id, k.status === 'verloren' ? 'gefunden' : 'rueckgabe', k.holder_id, ctx.user.id, ctx.body.note);
+  return getKey(k.id);
+}, { auth: 'admin' });
+
+route('POST', '/api/keys/:id/lost', (ctx) => {
+  const k = getKey(ctx.params.id);
+  if (k.status === 'verloren') throw new HttpError(400, 'Schlüssel ist bereits als verloren gemeldet');
+  db.prepare("UPDATE site_keys SET status='verloren', since=? WHERE id=?").run(nowLocal(), k.id);
+  keyEvent(k.id, 'verloren', k.holder_id, ctx.user.id, ctx.body.note);
+  return getKey(k.id);
+}, { auth: 'admin' });
+
+route('GET', '/api/keys/:id/events', (ctx) => {
+  getKey(ctx.params.id);
+  return db.prepare(`SELECT e.*, h.name AS holder_name, b.name AS by_name FROM key_events e
+    LEFT JOIN users h ON h.id = e.holder_id LEFT JOIN users b ON b.id = e.by_user_id
+    WHERE e.key_id = ? ORDER BY e.at DESC, e.id DESC`).all(Number(ctx.params.id));
+}, { auth: 'admin' });
+
+// Zähler für die Navigation (offene Anträge / Meldungen)
+route('GET', '/api/badges', () => ({
+  absences: db.prepare("SELECT COUNT(*) AS c FROM absences WHERE status = 'beantragt'").get().c,
+  issues: db.prepare("SELECT COUNT(*) AS c FROM issues WHERE status = 'offen'").get().c
+}), { auth: 'admin' });
+
 // ----- Übersicht & Auswertung -----
 route('GET', '/api/dashboard', () => {
   const today = nowLocal().slice(0, 10);
@@ -663,7 +1077,13 @@ route('GET', '/api/dashboard', () => {
     activeEmployees: db.prepare("SELECT COUNT(*) AS c FROM users WHERE active = 1").get().c,
     activeSites: db.prepare('SELECT COUNT(*) AS c FROM sites WHERE active = 1').get().c,
     recent: todays.slice(0, 15),
-    photos: queryPhotos({ limit: 12 })
+    photos: queryPhotos({ limit: 12 }),
+    absentToday: absencesIn(null, today, today).filter((a) => a.status === 'genehmigt'),
+    pendingAbsences: db.prepare(ABSENCE_SELECT + " WHERE a.status = 'beantragt' ORDER BY a.start_date").all().map(decorateAbsence),
+    openIssues: db.prepare(ISSUE_SELECT + " WHERE i.status != 'erledigt' ORDER BY i.created_at DESC LIMIT 6").all(),
+    openIssueCount: db.prepare("SELECT COUNT(*) AS c FROM issues WHERE status != 'erledigt'").get().c,
+    keysOut: db.prepare("SELECT COUNT(*) AS c FROM site_keys WHERE status = 'ausgegeben'").get().c,
+    keysLost: db.prepare("SELECT COUNT(*) AS c FROM site_keys WHERE status = 'verloren' AND active = 1").get().c
   };
 }, { auth: 'admin' });
 
@@ -691,11 +1111,13 @@ route('GET', '/api/report', (ctx) => {
     return {
       user_id: u.id, name: u.name, employment_type: u.employment_type, hourly_rate: u.hourly_rate,
       minutes, wage, days, entries: own.length,
+      vacationDays: absenceDays(u.id, ['urlaub'], from, to),
+      sickDays: absenceDays(u.id, SICK_TYPES, from, to),
       minijobWarning: u.employment_type === 'minijob' && limit > 0 && wage > limit
     };
   }).filter((r) => {
     const u = users.find((x) => x.id === r.user_id);
-    return r.entries > 0 || (u.active && u.role === 'employee');
+    return r.entries > 0 || r.vacationDays > 0 || r.sickDays > 0 || (u.active && u.role === 'employee');
   });
 
   const bySite = sites.map((s) => {
@@ -727,6 +1149,7 @@ route('GET', '/api/timesheet', (ctx) => {
   return {
     month: m, user: publicUser(user), entries, minutes,
     wage: Math.round((minutes / 60) * user.hourly_rate * 100) / 100,
+    absences: absencesIn(userId, from, to).filter((a) => a.status === 'genehmigt'),
     companyName: getSettings().company_name
   };
 });
@@ -771,7 +1194,11 @@ route('GET', '/api/backup', (ctx) => {
     users: db.prepare('SELECT * FROM users').all().map(publicUser),
     sites: db.prepare('SELECT * FROM sites').all(),
     entries: db.prepare('SELECT * FROM entries').all(),
-    photos: db.prepare('SELECT * FROM photos').all()
+    photos: db.prepare('SELECT * FROM photos').all(),
+    absences: db.prepare('SELECT * FROM absences').all(),
+    issues: db.prepare('SELECT * FROM issues').all(),
+    keys: db.prepare('SELECT * FROM site_keys').all(),
+    key_events: db.prepare('SELECT * FROM key_events').all()
   };
   ctx.res.writeHead(200, {
     'Content-Type': 'application/json; charset=utf-8',
@@ -796,7 +1223,7 @@ function serveStatic(req, res, pathname) {
   const ext = path.extname(file);
   res.writeHead(200, {
     'Content-Type': MIME[ext] || 'application/octet-stream',
-    'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=300',
+    'Cache-Control': 'no-cache',
     'X-Content-Type-Options': 'nosniff'
   });
   fs.createReadStream(file).pipe(res);

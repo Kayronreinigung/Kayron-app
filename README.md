@@ -12,6 +12,11 @@ Web-App zur Arbeitszeiterfassung für die Reinigungsfirma. Läuft im Browser auf
 - **Fotos hochladen** (z. B. vom gereinigten Treppenhaus) – direkt mit der Kamera oder aus der Galerie,
   mit Beschreibung (Treppenhaus, Eingang, Flur …). Fotos werden automatisch verkleinert.
 - „Meine Zeiten“: alle eigenen Einträge pro Monat + Stundennachweis
+- **Funktioniert auch ohne Internet** (Keller, Treppenhaus): Stempeln, Fotos und Meldungen werden auf dem
+  Handy gespeichert und automatisch übertragen, sobald wieder Netz da ist – mit der echten Uhrzeit
+- **Urlaub beantragen** und **krank melden**; Resturlaub und Krankheitstage immer im Blick
+- **Meldungen**: Defekt, Material fehlt, Schaden, Verschmutzung, Schlüsselproblem – mit Fotos
+- **Konto**: „Meine Schlüssel“ – welche Schlüssel man gerade hat
 
 **Für den Chef / Admin**
 - **Übersicht**: wer gerade wo im Einsatz ist (live), Stunden heute und im Monat
@@ -22,7 +27,14 @@ Web-App zur Arbeitszeiterfassung für die Reinigungsfirma. Läuft im Browser auf
   (vor Ort „Aktuellen Standort übernehmen“ tippen oder Koordinaten aus Google Maps einfügen).
 - **Fotos**: alle Fotos nach Tag und Objekt sortiert, filterbar; die neuesten auch auf der Übersicht
   und beim jeweiligen Zeiteintrag
-- **Mitarbeiter**: anlegen mit PIN, Stundenlohn, Anstellungsart (Minijob/Teilzeit/Vollzeit/Aushilfe), deaktivieren
+- **Urlaub & Krankheit**: Anträge genehmigen/ablehnen (auch direkt auf der Übersicht), Urlaubskonto pro Jahr
+  (Anspruch, genommen, geplant, Rest), Krankheitstage, Vermerk „AU liegt vor“. Gezählt werden Arbeitstage
+  Mo–Fr ohne bundesweite Feiertage. Abwesenheiten erscheinen auch im Stundennachweis und in der Auswertung.
+- **Meldungen**: alle Mängel-/Materialmeldungen mit Fotos und Ort; Status Offen → In Bearbeitung → Erledigt,
+  Notiz für den Mitarbeiter (z. B. „Hausverwaltung informiert“). Zähler für offene Punkte im Menü.
+- **Schlüssel**: Schlüssel pro Objekt anlegen, an Mitarbeiter ausgeben, weitergeben, zurücknehmen,
+  als verloren melden – mit vollständigem Verlauf. Beim Mitarbeiter wird angezeigt, wie viele Schlüssel er hat.
+- **Mitarbeiter**: anlegen mit PIN, Stundenlohn, Urlaubsanspruch, Anstellungsart (Minijob/Teilzeit/Vollzeit/Aushilfe), deaktivieren
 - **Objekte & Kunden**: Einsatzorte mit Adresse (Link zu Google Maps) und Notizen (Schlüssel, Codes …)
 - **Auswertung** pro Monat: Stunden und Bruttolohn je Mitarbeiter, Stunden je Objekt/Kunde (für Rechnungen),
   Warnung bei Überschreitung der **Minijob-Grenze** und bei Lohn unter **Mindestlohn**
@@ -62,6 +74,10 @@ der Eintrag zeigt dann „kein Standort“.
 erfasst, nicht dauerhaft. Informiere deine Mitarbeiter schriftlich darüber (Zweck: Nachweis der
 Arbeitszeit am Einsatzort gegenüber Kunden).
 
+**Offline-Modus:** Die App muss einmal mit Internet geöffnet worden sein (und der Mitarbeiter angemeldet),
+danach startet sie auch ohne Netz. Offline gespeicherte Aktionen, die älter als 3 Tage sind, werden nicht mehr
+angenommen. Einträge, die offline erfasst wurden, sind in der Datenbank markiert.
+
 Fotos liegen im Ordner `data/photos/` – bei der Datensicherung diesen Ordner mitsichern.
 
 Bitte außerdem regelmäßig unter *Einstellungen → Datensicherung*
@@ -70,4 +86,7 @@ eine Sicherung herunterladen (oder den Ordner `data/` sichern).
 ## Technik
 - `server.js` – Node.js-Server mit eingebauter SQLite-Datenbank (`node:sqlite`), keine Abhängigkeiten
 - `public/` – Oberfläche (HTML/CSS/JavaScript, ohne Framework)
+  - `app.js` Grundfunktionen, Stempeluhr, Zeiten, Mitarbeiter, Objekte, Auswertung
+  - `extra.js` Urlaub & Krankheit, Meldungen, Schlüssel
+  - `offline.js` + `sw.js` Offline-Modus (Warteschlange in IndexedDB, Service Worker)
 - Passwörter werden mit scrypt gehasht, Anmeldung über sichere HttpOnly-Cookies

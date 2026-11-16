@@ -57,6 +57,13 @@ const ICONS = {
   camera: '<path d="M4 8h3l2-3h6l2 3h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/><circle cx="12" cy="13.5" r="3.5"/>',
   pin: '<path d="M12 21s-7-6.2-7-11.5a7 7 0 0 1 14 0C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.5"/>',
   image: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M21 16l-5-5-9 9"/>',
+  calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+  alert: '<path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/>',
+  key: '<circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.7 12.3L21 2M16 7l3 3M18 5l2 2"/>',
+  check: '<path d="M20 6L9 17l-5-5"/>',
+  x: '<path d="M18 6L6 18M6 6l12 12"/>',
+  history: '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/>',
+  wifi_off: '<path d="M2 2l20 20M8.5 16.5a5 5 0 0 1 7 0M5 12.9a10 10 0 0 1 5.2-2.8M19 12.9a10 10 0 0 0-2.1-1.6M2 8.8a15 15 0 0 1 4.2-2.7M22 8.8a15 15 0 0 0-11.3-3.7M12 20h.01"/>',
   file: '<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M8 13h8M8 17h5"/>'
 };
 const icon = (n) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[n]}</svg>`;
@@ -145,27 +152,44 @@ function openPhoto(p, onChange) {
   });
 }
 
-// Lädt ein oder mehrere Fotos hoch (Standort wird mitgeschickt, wenn verfügbar)
+// Lädt ein oder mehrere Fotos hoch (Standort wird mitgeschickt, wenn verfügbar).
+// Ohne Internet werden sie auf dem Handy gespeichert und später automatisch hochgeladen.
 async function uploadPhotos(files, note, { entryId } = {}) {
   const loc = await getLocation(6000);
-  let ok = 0;
+  const out = { sent: 0, queued: 0 };
   for (const file of files) {
     const image = await compressImage(file);
-    await api('POST', '/api/photos', { image, note, entry_id: entryId || null, location: loc.error ? null : loc });
-    ok++;
+    const r = await Offline.send('/api/photos', { image, note, entry_id: entryId || null, location: loc.error ? null : loc },
+      { label: 'Foto' + (note ? ' „' + note + '“' : ''), userId: state.user.id });
+    if (r.queued) out.queued++; else out.sent++;
   }
-  return ok;
+  return out;
 }
 
 // ================= API =================
-async function api(method, url, body) {
-  const opts = { method, headers: {}, credentials: 'same-origin' };
+const netError = () => Object.assign(new Error('Keine Internetverbindung'), { network: true });
+
+async function api(method, url, body, { timeout = 30000, silent401 = false } = {}) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeout);
+  const opts = { method, headers: {}, credentials: 'same-origin', signal: ctrl.signal };
   if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
-  const res = await fetch(url, opts);
-  let data = null;
-  try { data = await res.json(); } catch { /* leer */ }
-  if (res.status === 401 && state.user) { state.user = null; render(); }
-  if (!res.ok) throw new Error((data && data.error) || `Fehler ${res.status}`);
+  let res, data = null;
+  try {
+    res = await fetch(url, opts);
+    try { data = await res.json(); } catch { /* leer */ }
+  } catch {
+    throw netError();
+  } finally {
+    clearTimeout(timer);
+  }
+  if ([502, 503, 504].includes(res.status)) throw netError();
+  if (res.status === 401 && state.user && !silent401 && url !== '/api/status') {
+    state.user = null;
+    try { localStorage.removeItem('lastUser'); } catch { /* egal */ }
+    render();
+  }
+  if (!res.ok) throw Object.assign(new Error((data && data.error) || `Fehler ${res.status}`), { status: res.status });
   return data;
 }
 
@@ -198,18 +222,23 @@ function navItems() {
   if (isAdmin()) {
     return [
       { page: 'uebersicht', label: 'Übersicht', icon: 'home', mobile: true },
-      { page: 'stempeln', label: 'Stempeluhr', icon: 'clock', mobile: true },
+      { page: 'stempeln', label: 'Stempeluhr', icon: 'clock' },
       { page: 'zeiten', label: 'Zeiten', icon: 'list', mobile: true },
+      { page: 'abwesenheiten', label: 'Urlaub & Krank', short: 'Abwesend', icon: 'calendar', mobile: true, badge: 'absences' },
+      { page: 'meldungen', label: 'Meldungen', icon: 'alert', mobile: true, badge: 'issues' },
       { page: 'mitarbeiter', label: 'Mitarbeiter', icon: 'users' },
       { page: 'objekte', label: 'Objekte', icon: 'building' },
+      { page: 'schluessel', label: 'Schlüssel', icon: 'key' },
       { page: 'fotos', label: 'Fotos', icon: 'camera' },
-      { page: 'auswertung', label: 'Auswertung', icon: 'chart', mobile: true },
+      { page: 'auswertung', label: 'Auswertung', icon: 'chart' },
       { page: 'einstellungen', label: 'Einstellungen', icon: 'settings' }
     ];
   }
   return [
-    { page: 'stempeln', label: 'Stempeluhr', icon: 'clock', mobile: true },
-    { page: 'meine-zeiten', label: 'Meine Zeiten', icon: 'list', mobile: true },
+    { page: 'stempeln', label: 'Stempeluhr', short: 'Stempeln', icon: 'clock', mobile: true },
+    { page: 'meine-zeiten', label: 'Meine Zeiten', short: 'Zeiten', icon: 'list', mobile: true },
+    { page: 'abwesenheiten', label: 'Urlaub & Krank', short: 'Urlaub', icon: 'calendar', mobile: true },
+    { page: 'meldungen', label: 'Meldung machen', short: 'Melden', icon: 'alert', mobile: true },
     { page: 'konto', label: 'Konto', icon: 'user', mobile: true }
   ];
 }
@@ -218,8 +247,11 @@ const PAGES = {
   uebersicht: { admin: true, render: pageDashboard },
   stempeln: { render: pageClock },
   zeiten: { admin: true, render: pageEntries },
+  abwesenheiten: { render: pageAbsences },
+  meldungen: { render: pageIssues },
   mitarbeiter: { admin: true, render: pageUsers },
   objekte: { admin: true, render: pageSites },
+  schluessel: { admin: true, render: pageKeys },
   fotos: { admin: true, render: pagePhotos },
   auswertung: { admin: true, render: pageReport },
   einstellungen: { admin: true, render: pageSettings },
@@ -234,17 +266,19 @@ async function render() {
   const app = $('#app');
   if (state.needsSetup) return renderSetup(app);
   if (!state.user) return renderLogin(app);
+  try { localStorage.setItem('lastUser', JSON.stringify({ user: state.user, companyName: state.companyName })); } catch { /* egal */ }
 
   let { page, params } = parseHash();
   const def = isAdmin() ? 'uebersicht' : 'stempeln';
   if (!PAGES[page] || (PAGES[page].admin && !isAdmin())) { page = def; history.replaceState(null, '', `#/${def}`); }
 
   const items = navItems();
-  const navLinks = (cls) => items.map((i) =>
-    `<a href="#/${i.page}" class="${page === i.page ? 'active' : ''} ${cls === 'bottom' && !i.mobile ? 'hidden' : ''}">${icon(i.icon)}<span>${i.label}</span></a>`
-  ).filter((l) => !l.includes(' hidden')).join('');
+  const navLinks = (where) => items.filter((i) => where === 'side' || i.mobile).map((i) =>
+    `<a href="#/${i.page}" class="${page === i.page ? 'active' : ''}">${icon(i.icon)}<span>${where === 'bottom' ? (i.short || i.label) : i.label}</span>` +
+    (i.badge ? `<b class="nav-badge" data-badge="${i.badge}" hidden></b>` : '') + '</a>'
+  ).join('');
 
-  const moreActive = isAdmin() && ['mitarbeiter', 'objekte', 'fotos', 'einstellungen', 'nachweis'].includes(page);
+  const moreActive = isAdmin() && !items.some((i) => i.page === page && i.mobile);
   app.innerHTML = `
     <div class="layout">
       <aside class="sidebar">
@@ -261,6 +295,7 @@ async function render() {
           <div class="brand"><img src="/icon.svg" alt=""><span>${esc(state.companyName)}</span></div>
           <button class="btn small light" data-action="logout" aria-label="Abmelden">${icon('logout')}</button>
         </header>
+        <div id="offline-banner" hidden></div>
         <main class="main" id="page"><div class="loading">Lädt …</div></main>
       </div>
     </div>
@@ -272,12 +307,25 @@ async function render() {
   $$('[data-action="logout"]', app).forEach((b) => b.onclick = logout);
   const more = $('[data-action="more"]', app);
   if (more) more.onclick = (e) => { e.preventDefault(); openMoreMenu(); };
+  updateOfflineBanner();
+  if (isAdmin()) {
+    api('GET', '/api/badges', undefined, { timeout: 8000 }).then((b) => {
+      $$('[data-badge]').forEach((el) => {
+        const n = b[el.dataset.badge] || 0;
+        el.textContent = n > 99 ? '99+' : n;
+        el.hidden = !n;
+      });
+    }).catch(() => {});
+  }
 
   const el = $('#page');
   try {
     await PAGES[page].render(el, params);
   } catch (err) {
-    el.innerHTML = `<div class="alert error">${esc(err.message)}</div>`;
+    el.innerHTML = err.network
+      ? `<div class="card empty">${icon('wifi_off')}<p><strong>Keine Internetverbindung.</strong><br>Diese Seite braucht Internet. Stempeln, Fotos und Meldungen funktionieren auch offline.</p>
+          <button class="btn" onclick="render()">Erneut versuchen</button></div>`
+      : `<div class="alert error">${esc(err.message)}</div>`;
   }
 }
 
@@ -293,7 +341,12 @@ function openMoreMenu() {
 }
 
 async function logout() {
+  const waiting = (await Offline.pending(state.user && state.user.id)).length;
+  if (waiting && !confirm(`Es warten noch ${waiting} offline gespeicherte Aktionen auf Übertragung. Sie werden gesendet, sobald du dich wieder anmeldest.
+
+Trotzdem abmelden?`)) return;
   try { await api('POST', '/api/logout', {}); } catch { /* egal */ }
+  try { localStorage.removeItem('lastUser'); } catch { /* egal */ }
   state.user = null;
   location.hash = '';
   render();
@@ -358,7 +411,16 @@ function closeModal() { $('#modal-root').innerHTML = ''; }
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
 
 // ================= Daten laden =================
-async function loadSites() { state.sites = await api('GET', '/api/sites'); return state.sites; }
+async function loadSites() {
+  try {
+    state.sites = await api('GET', '/api/sites');
+    try { localStorage.setItem('sitesCache', JSON.stringify(state.sites)); } catch { /* egal */ }
+  } catch (e) {
+    if (!e.network) throw e;
+    try { state.sites = JSON.parse(localStorage.getItem('sitesCache') || '[]'); } catch { state.sites = []; }
+  }
+  return state.sites;
+}
 async function loadUsers() { state.users = await api('GET', '/api/users'); return state.users; }
 async function loadSettings() { state.settings = await api('GET', '/api/settings'); return state.settings; }
 
@@ -464,11 +526,33 @@ async function pageDashboard(el) {
           <div class="dur">${fmtDur(e.minutes)}</div></li>`).join('')}</ul>` : '<div class="empty">Heute noch keine Einträge.</div>'}
       </div>
     </div>
+    <div class="grid two-col" style="margin-top:16px">
+      <div class="card">
+        <div class="page-head" style="margin-bottom:8px"><h2 style="margin:0">${icon('calendar')} Abwesend & Anträge</h2><a class="btn small" href="#/abwesenheiten">Alle</a></div>
+        ${d.absentToday.length ? `<ul class="entry-list">${d.absentToday.map((a) => `
+          <li><div><div class="when">${esc(a.user_name)}</div><div class="muted small">bis ${fmtDate(a.end_date)}</div></div>${absenceBadge(a)}</li>`).join('')}</ul>`
+          : '<div class="muted small" style="padding:6px 0 10px">Heute niemand abwesend.</div>'}
+        ${d.pendingAbsences.length ? `<h3 style="margin-top:12px">Offene Anträge (${d.pendingAbsences.length})</h3>
+          <ul class="entry-list">${d.pendingAbsences.slice(0, 5).map((a) => `
+          <li><div><div class="when">${esc(a.user_name)} ${absenceBadge(a)}</div><div class="muted small">${fmtRange(a)} · ${a.days} Arbeitstag${a.days === 1 ? '' : 'e'}</div></div>
+            <div class="nowrap"><button class="btn small" data-approve="${a.id}" title="Genehmigen">${icon('check')}</button> <button class="btn small danger" data-reject="${a.id}" title="Ablehnen">${icon('x')}</button></div></li>`).join('')}</ul>` : ''}
+      </div>
+      <div class="card">
+        <div class="page-head" style="margin-bottom:8px"><h2 style="margin:0">${icon('alert')} Offene Meldungen${d.openIssueCount ? ` (${d.openIssueCount})` : ''}</h2><a class="btn small" href="#/meldungen">Alle</a></div>
+        ${d.openIssues.length ? `<ul class="entry-list">${d.openIssues.map((i) => `
+          <li><div><div class="when">${issueCategoryBadge(i)} ${esc(i.site_name || 'ohne Objekt')}</div>
+            <div class="small">${esc(i.description).slice(0, 90)}${i.description.length > 90 ? ' …' : ''}</div>
+            <div class="muted small">${esc(i.user_name)} · ${fmtDate(i.created_at, false)} ${fmtTime(i.created_at)}</div></div>${issueStatusBadge(i)}</li>`).join('')}</ul>`
+          : '<div class="empty">Keine offenen Meldungen.</div>'}
+        ${d.keysOut || d.keysLost ? `<p class="small" style="margin-bottom:0"><a href="#/schluessel">${icon('key')} ${d.keysOut} Schlüssel ausgegeben${d.keysLost ? ` · <span style="color:var(--danger)">${d.keysLost} verloren</span>` : ''}</a></p>` : ''}
+      </div>
+    </div>
     <div class="card" style="margin-top:16px">
       <div class="page-head" style="margin-bottom:8px"><h2 style="margin:0">${icon('camera')} Neueste Fotos</h2><a class="btn small" href="#/fotos">Alle Fotos</a></div>
       ${photoGrid(d.photos, { showDate: true })}
     </div>`;
   bindPhotoGrid(el, d.photos);
+  bindAbsenceDecisions(el);
   startLiveDurations(el);
   $$('[data-stop]', el).forEach((b) => b.onclick = async () => {
     if (!confirm('Diesen Mitarbeiter jetzt ausstempeln?')) return;
@@ -489,15 +573,54 @@ function startLiveDurations(root) {
 // ================= Seite: Stempeluhr =================
 const PHOTO_LABELS = ['Treppenhaus', 'Eingang', 'Flur', 'Büro', 'Sanitär', 'Küche', 'Fenster'];
 
+// Stempeluhr-Daten: vom Server – oder ohne Netz aus dem Zwischenspeicher, ergänzt um offline gespeicherte Aktionen
+async function loadClockData() {
+  await loadSites();
+  const key = 'clockCache:' + state.user.id;
+  const today = localDate();
+  let c;
+  try {
+    c = await api('GET', '/api/clock', undefined, { timeout: 12000 });
+    try { localStorage.setItem(key, JSON.stringify(c)); } catch { /* egal */ }
+  } catch (e) {
+    if (!e.network) throw e;
+    try { c = JSON.parse(localStorage.getItem(key) || 'null'); } catch { c = null; }
+    c = c || { running: null, today: [], photos: [] };
+    c.today = c.today.filter((x) => x.start.slice(0, 10) === today || !x.end);
+    c.photos = c.photos.filter((x) => x.taken_at.slice(0, 10) === today);
+    c.offline = true;
+  }
+  const mins = (a, b) => Math.max(0, Math.round((new Date(b + ':00') - new Date(a + ':00')) / 60000));
+  c.pendingPhotos = [];
+  for (const it of await Offline.pending(state.user.id)) {
+    if (it.url === '/api/clock/in') {
+      const site = state.sites.find((x) => String(x.id) === String(it.body.site_id));
+      c.running = { id: 'p-' + it.id, start: it.body.at, site_id: it.body.site_id, site_name: site ? site.name : '', note: '', break_minutes: 0, photo_count: 0, pending: true };
+      c.today = [c.running, ...c.today];
+    } else if (it.url === '/api/clock/out' && c.running) {
+      const done = { ...c.running, end: it.body.at, break_minutes: it.body.break_minutes || 0, pending: true };
+      c.today = c.today.map((x) => (x.id === c.running.id ? done : x));
+      c.running = null;
+    } else if (it.url === '/api/photos') {
+      c.pendingPhotos.push(it);
+    }
+  }
+  const now = Offline.nowStamp();
+  c.today.forEach((x) => { x.minutes = Math.max(0, mins(x.start, x.end || now) - (x.break_minutes || 0)); });
+  c.todayMinutes = c.today.filter((x) => x.start.slice(0, 10) === today).reduce((sum, x) => sum + x.minutes, 0);
+  return c;
+}
+
 async function pageClock(el) {
-  const [c] = await Promise.all([api('GET', '/api/clock'), loadSites()]);
+  const c = await loadClockData();
   const r = c.running;
   const lastSite = localStorage.getItem('lastSite') || '';
   const canPhoto = !!(r || c.today.length);
   el.innerHTML = `
     <div class="page-head"><div><h1>Stempeluhr</h1><div class="muted">Hallo ${esc(state.user.name.split(' ')[0])} · ${fmtDate(localDate())}</div></div></div>
     <div class="card clock-card">
-      <div class="clock-status ${r ? 'on' : ''}">${r ? '<span class="live-dot"></span>Eingestempelt seit ' + fmtTime(r.start) : 'Nicht eingestempelt'}</div>
+      ${c.offline ? `<div class="badge warn" style="margin-bottom:10px">${icon('wifi_off')}Offline – wird später übertragen</div>` : ''}
+      <div class="clock-status ${r ? 'on' : ''}">${r ? '<span class="live-dot"></span>Eingestempelt seit ' + fmtTime(r.start) + (r.start.slice(0, 10) !== localDate() ? ' (' + fmtDate(r.start, false) + ')' : '') : 'Nicht eingestempelt'}</div>
       ${r ? `<div class="muted">${esc(r.site_name || 'ohne Objekt')}</div>` : ''}
       <div class="clock-time" id="clock-time">${r ? '0:00:00' : new Date().toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })}</div>
       ${r ? `
@@ -535,13 +658,15 @@ async function pageClock(el) {
         </div>
         <div id="photo-status" class="muted small" style="margin-top:8px"></div>
         <div id="photo-list" style="margin-top:12px">${c.photos.length ? photoGrid(c.photos, { showWho: false }) : ''}</div>
+        ${c.pendingPhotos.length ? `<div class="muted small" style="margin:12px 0 6px">${icon('wifi_off')} Warten auf Internet (${c.pendingPhotos.length}):</div>
+          <div class="photo-grid">${c.pendingPhotos.map((it) => `<div class="photo-thumb pending"><img src="${it.body.image}" alt=""><span class="photo-cap">${esc(it.body.note || '')}<br>${fmtTime(it.body.at)} · wartet</span></div>`).join('')}</div>` : ''}
       ` : '<div class="empty">Bitte zuerst einstempeln – danach kannst du hier Fotos hochladen.</div>'}
     </div>
 
     <div class="card">
       <h2>Heute: ${fmtDur(c.todayMinutes)}</h2>
       ${c.today.length ? `<ul class="entry-list">${c.today.map((e) => `
-        <li><div><div class="when">${fmtTime(e.start)} – ${e.end ? fmtTime(e.end) : 'läuft'}</div><div class="muted small">${esc(e.site_name || 'ohne Objekt')}${e.break_minutes ? ' · ' + e.break_minutes + ' Min Pause' : ''}${e.photo_count ? ' · ' + e.photo_count + ' Foto' + (e.photo_count > 1 ? 's' : '') : ''}</div></div>
+        <li><div><div class="when">${fmtTime(e.start)} – ${e.end ? fmtTime(e.end) : 'läuft'}</div><div class="muted small">${esc(e.site_name || 'ohne Objekt')}${e.break_minutes ? ' · ' + e.break_minutes + ' Min Pause' : ''}${e.photo_count ? ' · ' + e.photo_count + ' Foto' + (e.photo_count > 1 ? 's' : '') : ''}${e.pending ? ' · <span style="color:var(--warn)">wartet auf Internet</span>' : ''}</div></div>
         <div class="dur">${fmtDur(e.minutes)}</div></li>`).join('')}</ul>` : '<div class="empty">Heute noch nichts erfasst.</div>'}
     </div>`;
 
@@ -578,14 +703,15 @@ async function pageClock(el) {
     }
     btn.textContent = r ? 'Wird ausgestempelt …' : 'Wird eingestempelt …';
     const location = loc.error ? null : loc;
+    const opts = { userId: state.user.id };
     try {
       if (r) {
-        await api('POST', '/api/clock/out', { break_minutes: Number(data.break_minutes || 0), note: data.note, location });
-        toast('Ausgestempelt – schönen Feierabend!' + (location ? '' : ' (ohne Standort)'));
+        const res = await Offline.send('/api/clock/out', { break_minutes: Number(data.break_minutes || 0), note: data.note, location }, { ...opts, label: 'Ausstempeln' });
+        toast(res.queued ? 'Ausgestempelt – ohne Internet gespeichert, wird automatisch übertragen' : 'Ausgestempelt – schönen Feierabend!' + (location ? '' : ' (ohne Standort)'));
       } else {
-        await api('POST', '/api/clock/in', { site_id: data.site_id || null, location });
+        const res = await Offline.send('/api/clock/in', { site_id: data.site_id || null, location }, { ...opts, label: 'Einstempeln' });
         if (data.site_id) localStorage.setItem('lastSite', data.site_id);
-        toast('Eingestempelt' + (location ? ' – Standort gespeichert' : ' (ohne Standort)'));
+        toast(res.queued ? 'Eingestempelt – ohne Internet gespeichert, wird automatisch übertragen' : 'Eingestempelt' + (location ? ' – Standort gespeichert' : ' (ohne Standort)'));
       }
       render();
     } catch (e) { toast(e.message, true); btn.disabled = false; btn.innerHTML = label; }
@@ -610,7 +736,8 @@ async function pageClock(el) {
       status.textContent = files.length > 1 ? `${files.length} Fotos werden hochgeladen …` : 'Foto wird hochgeladen …';
       try {
         const n = await uploadPhotos(files, $('#photo-note').value);
-        toast(n > 1 ? `${n} Fotos hochgeladen` : 'Foto hochgeladen');
+        if (n.queued) toast(`${n.queued === 1 ? 'Foto' : n.queued + ' Fotos'} ohne Internet gespeichert – wird automatisch hochgeladen`);
+        else toast(n.sent > 1 ? `${n.sent} Fotos hochgeladen` : 'Foto hochgeladen');
         render();
       } catch (e) {
         status.textContent = '';
@@ -761,7 +888,7 @@ async function pageUsers(el) {
         <thead><tr><th>Name</th><th>Benutzername</th><th class="hide-mobile">Anstellung</th><th class="right">Stundenlohn</th><th class="hide-mobile">Telefon</th><th>Status</th><th></th></tr></thead>
         <tbody>${users.map((u) => `
           <tr class="${u.active ? '' : 'inactive'}">
-            <td><strong>${esc(u.name)}</strong> ${u.role === 'admin' ? '<span class="badge brand">Admin</span>' : ''}</td>
+            <td><strong>${esc(u.name)}</strong> ${u.role === 'admin' ? '<span class="badge brand">Admin</span>' : ''}${u.keys_held ? ` <span class="badge" title="Hat ${u.keys_held} Schlüssel">${icon('key')}${u.keys_held}</span>` : ''}</td>
             <td>${esc(u.username)}</td>
             <td class="hide-mobile">${EMPLOYMENT[u.employment_type] || '–'}</td>
             <td class="right num nowrap">${u.hourly_rate ? money(u.hourly_rate) : '–'} ${u.hourly_rate && minWage && u.hourly_rate < minWage && u.employment_type !== 'inhaber' ? '<span class="badge warn" title="Unter Mindestlohn">!</span>' : ''}</td>
@@ -788,6 +915,7 @@ function userModal(u, minWage) {
       <div class="field"><label>Stundenlohn (€)</label><input name="hourly_rate" type="number" step="0.01" min="0" value="${x.hourly_rate ?? ''}"></div>
     </div>
     <div class="alert warn" id="wage-warn" hidden>Achtung: unter dem gesetzlichen Mindestlohn (${money(minWage)}).</div>
+    <div class="field"><label>Urlaubsanspruch (Arbeitstage pro Jahr)</label><input name="vacation_days" type="number" step="0.5" min="0" value="${x.vacation_days ?? ''}" placeholder="z. B. 20"></div>
     <div class="row">
       <div class="field"><label>Telefon</label><input name="phone" type="tel" value="${esc(x.phone || '')}"></div>
       <div class="field"><label>Rolle</label><select name="role">
@@ -795,8 +923,10 @@ function userModal(u, minWage) {
         <option value="admin" ${x.role === 'admin' ? 'selected' : ''}>Administrator</option></select></div>
     </div>
     <label class="check"><input type="checkbox" name="active" ${x.active ? 'checked' : ''}> Aktiv (darf sich anmelden)</label>
+    ${u && u.keys_held ? `<div class="alert warn" style="margin:12px 0 0">${icon('key')} Hat noch ${u.keys_held} Schlüssel – vor dem Ausscheiden bitte unter <a href="#/schluessel">Schlüssel</a> zurücknehmen.</div>` : ''}
   `, {
     onSave: async (d) => {
+      d.vacation_days = Number(String(d.vacation_days || 0).replace(',', '.')) || 0;
       d.hourly_rate = Number(String(d.hourly_rate).replace(',', '.')) || 0;
       if (!d.password) delete d.password;
       if (u) await api('PUT', `/api/users/${u.id}`, d);
@@ -948,18 +1078,20 @@ async function pageReport(el, params) {
       <div class="page-head" style="margin-bottom:8px"><h2 style="margin:0">Nach Mitarbeiter</h2>
         <a class="btn small" href="/api/export.csv?from=${r.from}&to=${r.to}">${icon('download')} CSV / Excel</a></div>
       <div class="table-wrap"><table>
-        <thead><tr><th>Mitarbeiter</th><th class="hide-mobile">Anstellung</th><th class="right hide-mobile">Tage</th><th class="right">Stunden</th><th class="right hide-mobile">Lohn/Std.</th><th class="right">Betrag</th><th></th></tr></thead>
+        <thead><tr><th>Mitarbeiter</th><th class="hide-mobile">Anstellung</th><th class="right hide-mobile">Tage</th><th class="right hide-mobile">Urlaub</th><th class="right hide-mobile">Krank</th><th class="right">Stunden</th><th class="right hide-mobile">Lohn/Std.</th><th class="right">Betrag</th><th></th></tr></thead>
         <tbody>${r.byUser.map((u) => `
           <tr>
             <td><strong>${esc(u.name)}</strong></td>
             <td class="hide-mobile">${EMPLOYMENT[u.employment_type] || ''}</td>
             <td class="right num hide-mobile">${u.days}</td>
+            <td class="right num hide-mobile">${u.vacationDays || '–'}</td>
+            <td class="right num hide-mobile">${u.sickDays || '–'}</td>
             <td class="right num nowrap">${fmtDur(u.minutes)}<div class="muted small">${fmtDec(u.minutes)}</div></td>
             <td class="right num hide-mobile">${u.hourly_rate ? money(u.hourly_rate) : '–'}</td>
             <td class="right num nowrap">${money(u.wage)} ${u.minijobWarning ? '<span class="badge warn">über Grenze</span>' : ''}</td>
             <td class="right"><a class="btn small" href="#/nachweis?user=${u.user_id}&month=${m}">${icon('file')} <span class="hide-mobile">Nachweis</span></a></td>
           </tr>`).join('')}</tbody>
-        <tfoot><tr><td>Summe</td><td class="hide-mobile"></td><td class="hide-mobile"></td><td class="right num">${fmtDur(r.totalMinutes)}</td><td class="hide-mobile"></td><td class="right num">${money(r.totalWage)}</td><td></td></tr></tfoot>
+        <tfoot><tr><td>Summe</td><td class="hide-mobile"></td><td class="hide-mobile"></td><td class="hide-mobile"></td><td class="hide-mobile"></td><td class="right num">${fmtDur(r.totalMinutes)}</td><td class="hide-mobile"></td><td class="right num">${money(r.totalWage)}</td><td></td></tr></tfoot>
       </table></div>
     </div>
     <div class="card">
@@ -1006,6 +1138,9 @@ async function pageTimesheet(el, params) {
           ${t.user.hourly_rate ? `<tr><td colspan="5">Bruttolohn (${money(t.user.hourly_rate)} / Std.)</td><td class="right num nowrap" colspan="2">${money(t.wage)}</td></tr>` : ''}
         </tfoot>
       </table>` : '<div class="empty">Keine Einträge in diesem Monat.</div>'}
+      ${t.absences.length ? `<h3 style="margin-top:20px">Abwesenheiten</h3>
+        <table><thead><tr><th>Zeitraum</th><th>Art</th><th class="right">Arbeitstage im Monat</th></tr></thead>
+        <tbody>${t.absences.map((a) => `<tr><td>${fmtRange(a)}</td><td>${ABSENCE_TYPES[a.type] || a.type}${SICK.includes(a.type) && a.certificate ? ' (AU liegt vor)' : ''}</td><td class="right num">${a.daysInRange}</td></tr>`).join('')}</tbody></table>` : ''}
       <div class="signatures"><div>Datum, Unterschrift Mitarbeiter/in</div><div>Datum, Unterschrift Arbeitgeber</div></div>
     </div>`;
   bindMonthPicker('nachweis', isAdmin() ? { user: userId } : {});
@@ -1066,8 +1201,18 @@ function bindPasswordForm() {
 }
 
 async function pageAccount(el) {
+  const keys = await api('GET', '/api/keys/mine').catch(() => []);
   el.innerHTML = `
     <div class="page-head"><div><h1>Mein Konto</h1><div class="muted">${esc(state.user.name)} · ${esc(state.user.username)}</div></div></div>
+    <div class="card">
+      <h2>${icon('key')} Meine Schlüssel</h2>
+      ${keys.length ? `<ul class="entry-list">${keys.map((k) => `
+        <li><div><div class="when">${esc(k.label)}${k.number ? ` <span class="muted small">Nr. ${esc(k.number)}</span>` : ''}</div>
+          <div class="muted small">${esc(k.site_name || 'ohne Objekt')}</div></div>
+          <div class="muted small nowrap">seit ${fmtDate(k.since, false)}</div></li>`).join('')}</ul>
+        <p class="muted small" style="margin-bottom:0">Schlüssel verloren? Bitte sofort über „Melden“ Bescheid geben.</p>`
+        : '<div class="muted">Du hast aktuell keine Schlüssel.</div>'}
+    </div>
     ${passwordCard()}
     <div class="card"><button class="btn danger" id="lo">${icon('logout')} Abmelden</button></div>`;
   bindPasswordForm();
@@ -1122,15 +1267,25 @@ async function boot() {
     state.user = s.user;
     document.title = `${s.companyName} – Zeiterfassung`;
   } catch (e) {
-    $('#app').innerHTML = `<div class="loading">Server nicht erreichbar: ${esc(e.message)}</div>`;
+    // Ohne Netz: mit dem zuletzt angemeldeten Benutzer weiterarbeiten (Stempeln geht offline)
+    let cached = null;
+    try { cached = JSON.parse(localStorage.getItem('lastUser') || 'null'); } catch { /* egal */ }
+    if (e.network && cached && cached.user) {
+      state.user = cached.user;
+      state.companyName = cached.companyName || state.companyName;
+      render();
+      return;
+    }
+    $('#app').innerHTML = `<div class="loading">Server nicht erreichbar: ${esc(e.message)}<br><br><button class="btn" onclick="boot()">Erneut versuchen</button></div>`;
     return;
   }
   render();
+  offlineSync();
 }
 
 window.addEventListener('hashchange', render);
 // Beim Zurückkehren zur App (z. B. Handy entsperrt) Seite aktualisieren
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && state.user && !$('#modal-root').innerHTML) render();
+  if (document.visibilityState === 'visible' && state.user && !$('#modal-root').innerHTML) { render(); offlineSync({ quiet: false }); }
 });
 boot();

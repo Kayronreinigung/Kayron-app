@@ -265,3 +265,52 @@ h3 svg, .muted.small svg { width: 14px; height: 14px; vertical-align: -2px; }
 .entry-details .photo-grid { grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); }
 @media (max-width: 1280px) and (min-width: 861px) { .hide-mid { display: none; } }
 .badge svg { width: 12px; height: 12px; vertical-align: -2px; margin-right: 3px; }
+
+/* ---------- Navigation: Zähler ---------- */
+.nav a .nav-badge { margin-left: auto; }
+.nav-badge {
+  background: #e5533d; color: #fff; border-radius: 99px; font-size: .7rem; font-weight: 700; line-height: 1;
+  padding: 3px 6px; min-width: 18px; text-align: center; font-style: normal;
+}
+.bottom-nav a { position: relative; }
+.bottom-nav .nav-badge { position: absolute; top: 0; left: calc(50% + 6px); }
+
+/* ---------- Offline ---------- */
+.offline-banner {
+  background: var(--warn-soft); color: var(--warn); padding: 10px 32px; font-size: .88rem;
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid #f1d9ac;
+}
+.offline-banner.off { background: #3b3f3f; color: #fff; border-color: #3b3f3f; }
+@media (max-width: 860px) { .offline-banner { padding: 10px 16px; position: sticky; top: 56px; z-index: 15; } }
+.badge svg { width: 12px; height: 12px; vertical-align: -2px; margin-right: 3px; }
+.empty > svg { width: 36px; height: 36px; color: var(--muted); }
+.photo-thumb.pending { opacity: .75; cursor: default; }
+.photo-thumb.pending::after { content: ''; position: absolute; inset: 0; border: 2px dashed var(--warn); border-radius: 10px; }
+
+/* ---------- Abwesenheiten ---------- */
+.action-row { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
+.action-row .btn { flex: 1; min-width: 160px; }
+.btn.big { min-height: 52px; font-size: 1.02rem; font-weight: 600; }
+.value.neg, strong.neg { color: var(--danger); }
+.card.highlight { border-color: #f1d9ac; background: #fffaf0; }
+.reply { background: var(--brand-soft); color: var(--brand-dark); border-radius: 8px; padding: 6px 10px; margin-top: 6px; }
+
+/* ---------- Meldungen ---------- */
+.issue-list { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
+@media (max-width: 520px) { .issue-list { grid-template-columns: 1fr; } }
+.issue-card { background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--warn); border-radius: var(--radius); padding: 14px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 8px; }
+.issue-card.in_bearbeitung { border-left-color: var(--brand); }
+.issue-card.erledigt { border-left-color: var(--ok); opacity: .85; }
+.issue-head { display: flex; justify-content: space-between; gap: 8px; align-items: flex-start; }
+.issue-text { white-space: pre-wrap; }
+.issue-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 2px; }
+.photo-grid.small { grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); gap: 6px; }
+.photo-grid.small .photo-cap { display: none; }
+.thumb-remove { position: absolute; top: 4px; right: 4px; width: 26px; height: 26px; border-radius: 50%; border: none; background: rgba(0,0,0,.6); color: #fff; cursor: pointer; font-size: .8rem; }
+a.chip { text-decoration: none; color: inherit; }
+
+/* ---------- Schlüssel ---------- */
+.key-actions { white-space: nowrap; }
+@media (max-width: 640px) { .key-actions { white-space: normal; } .key-actions .btn { margin-bottom: 4px; } }
+.entry-list li > .badge, .entry-list li > div > .badge:only-child { align-self: flex-start; }
+@media (max-width: 520px) { .action-row .btn { flex-basis: 100%; } }
