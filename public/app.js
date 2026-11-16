@@ -54,9 +54,108 @@ const ICONS = {
   left: '<path d="M15 18l-6-6 6-6"/>',
   right: '<path d="M9 18l6-6-6-6"/>',
   logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>',
+  camera: '<path d="M4 8h3l2-3h6l2 3h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/><circle cx="12" cy="13.5" r="3.5"/>',
+  pin: '<path d="M12 21s-7-6.2-7-11.5a7 7 0 0 1 14 0C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.5"/>',
+  image: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M21 16l-5-5-9 9"/>',
   file: '<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M8 13h8M8 17h5"/>'
 };
 const icon = (n) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[n]}</svg>`;
+
+// ================= Standort =================
+// Ermittelt den aktuellen GPS-Standort. Bei Ablehnung/Fehler kommt { error } zurück – Stempeln geht trotzdem.
+function getLocation(timeoutMs = 12000) {
+  return new Promise((resolve) => {
+    if (!navigator.geolocation) return resolve({ error: 'Gerät unterstützt keinen Standort' });
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+    setTimeout(() => finish({ error: 'Standort nicht rechtzeitig gefunden' }), timeoutMs + 1000);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => finish({ lat: pos.coords.latitude, lng: pos.coords.longitude, accuracy: Math.round(pos.coords.accuracy) }),
+      (err) => finish({ error: err.code === 1 ? 'Standortzugriff wurde nicht erlaubt' : 'Standort nicht verfügbar' }),
+      { enableHighAccuracy: true, timeout: timeoutMs, maximumAge: 0 }
+    );
+  });
+}
+const mapsUrl = (lat, lng) => `https://www.google.com/maps?q=${lat},${lng}`;
+function fmtDist(m) { return m >= 1000 ? (m / 1000).toLocaleString('de-DE', { maximumFractionDigits: 1 }) + ' km' : m + ' m'; }
+
+// Standort-Anzeige für Beginn ('start') oder Ende ('end') eines Eintrags
+function locBadge(e, which) {
+  const lat = e[which + '_lat'], lng = e[which + '_lng'];
+  if (lat === null || lat === undefined) return '<span class="badge" title="Kein Standort gespeichert">kein Standort</span>';
+  const dist = e[which + '_distance'];
+  let cls = 'brand', txt = 'Karte';
+  if (dist !== null && dist !== undefined) {
+    const tolerance = 250 + (e[which + '_acc'] || 0);
+    cls = dist <= tolerance ? 'ok' : 'warn';
+    txt = dist <= tolerance ? 'am Objekt' : fmtDist(dist) + ' entfernt';
+  }
+  return `<a class="badge ${cls} loc" href="${mapsUrl(lat, lng)}" target="_blank" rel="noopener" title="Genauigkeit ±${e[which + '_acc'] ?? '?'} m">${icon('pin')}${txt}</a>`;
+}
+
+// ================= Fotos =================
+// Verkleinert ein Foto im Browser (max. 1600 px, JPEG), damit der Upload mobil schnell geht
+function compressImage(file, maxSide = 1600, quality = 0.8) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      resolve(c.toDataURL('image/jpeg', quality));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Bild konnte nicht gelesen werden')); };
+    img.src = url;
+  });
+}
+const photoUrl = (p) => `/api/photos/${p.id}/file`;
+
+function photoGrid(photos, { showWho = true, showDate = false } = {}) {
+  if (!photos.length) return '<div class="empty">Keine Fotos.</div>';
+  return `<div class="photo-grid">${photos.map((p) => `
+    <button type="button" class="photo-thumb" data-photo="${p.id}" title="${esc(p.note)}">
+      <img src="${photoUrl(p)}" alt="${esc(p.note || 'Foto')}" loading="lazy">
+      <span class="photo-cap">${p.note ? esc(p.note) + '<br>' : ''}${showDate ? fmtDate(p.taken_at, false) + ' ' : ''}${fmtTime(p.taken_at)}${showWho ? ' · ' + esc(p.user_name) : ''}</span>
+    </button>`).join('')}</div>`;
+}
+
+// Klick auf ein Vorschaubild öffnet die Großansicht
+function bindPhotoGrid(root, photos, onChange) {
+  $$('[data-photo]', root).forEach((b) => b.onclick = () => {
+    const p = photos.find((x) => x.id === Number(b.dataset.photo));
+    if (p) openPhoto(p, onChange);
+  });
+}
+
+function openPhoto(p, onChange) {
+  const canDelete = isAdmin() || (p.user_id === state.user.id && p.taken_at.slice(0, 10) === localDate());
+  openModal(p.note || 'Foto', `
+    <img src="${photoUrl(p)}" alt="" style="width:100%;border-radius:10px;display:block;background:#eee">
+    <p class="small" style="margin:10px 0 0">
+      <strong>${esc(p.user_name)}</strong> · ${fmtDate(p.taken_at)}, ${fmtTime(p.taken_at)} Uhr<br>
+      ${esc(p.site_name || 'ohne Objekt')}
+      ${p.lat !== null ? ` · <a href="${mapsUrl(p.lat, p.lng)}" target="_blank" rel="noopener">Aufnahmeort auf Karte</a>` : ''}
+    </p>`, {
+    wide: true, saveLabel: 'Original öffnen',
+    onSave: async () => { window.open(photoUrl(p), '_blank'); },
+    onDelete: canDelete ? async () => { await api('DELETE', `/api/photos/${p.id}`); toast('Foto gelöscht'); onChange ? onChange() : render(); } : null
+  });
+}
+
+// Lädt ein oder mehrere Fotos hoch (Standort wird mitgeschickt, wenn verfügbar)
+async function uploadPhotos(files, note, { entryId } = {}) {
+  const loc = await getLocation(6000);
+  let ok = 0;
+  for (const file of files) {
+    const image = await compressImage(file);
+    await api('POST', '/api/photos', { image, note, entry_id: entryId || null, location: loc.error ? null : loc });
+    ok++;
+  }
+  return ok;
+}
 
 // ================= API =================
 async function api(method, url, body) {
@@ -103,6 +202,7 @@ function navItems() {
       { page: 'zeiten', label: 'Zeiten', icon: 'list', mobile: true },
       { page: 'mitarbeiter', label: 'Mitarbeiter', icon: 'users' },
       { page: 'objekte', label: 'Objekte', icon: 'building' },
+      { page: 'fotos', label: 'Fotos', icon: 'camera' },
       { page: 'auswertung', label: 'Auswertung', icon: 'chart', mobile: true },
       { page: 'einstellungen', label: 'Einstellungen', icon: 'settings' }
     ];
@@ -120,6 +220,7 @@ const PAGES = {
   zeiten: { admin: true, render: pageEntries },
   mitarbeiter: { admin: true, render: pageUsers },
   objekte: { admin: true, render: pageSites },
+  fotos: { admin: true, render: pagePhotos },
   auswertung: { admin: true, render: pageReport },
   einstellungen: { admin: true, render: pageSettings },
   nachweis: { render: pageTimesheet },
@@ -143,7 +244,7 @@ async function render() {
     `<a href="#/${i.page}" class="${page === i.page ? 'active' : ''} ${cls === 'bottom' && !i.mobile ? 'hidden' : ''}">${icon(i.icon)}<span>${i.label}</span></a>`
   ).filter((l) => !l.includes(' hidden')).join('');
 
-  const moreActive = isAdmin() && ['mitarbeiter', 'objekte', 'einstellungen', 'nachweis'].includes(page);
+  const moreActive = isAdmin() && ['mitarbeiter', 'objekte', 'fotos', 'einstellungen', 'nachweis'].includes(page);
   app.innerHTML = `
     <div class="layout">
       <aside class="sidebar">
@@ -350,7 +451,8 @@ async function pageDashboard(el) {
         ${d.running.length ? `<ul class="entry-list">${d.running.map((e) => `
           <li>
             <div><div class="when">${esc(e.user_name)}</div>
-              <div class="muted small">${esc(e.site_name || 'ohne Objekt')} · seit ${fmtTime(e.start)}${e.start.slice(0, 10) !== localDate() ? ' (' + fmtDate(e.start, false) + ')' : ''}</div></div>
+              <div class="muted small">${esc(e.site_name || 'ohne Objekt')} · seit ${fmtTime(e.start)}${e.start.slice(0, 10) !== localDate() ? ' (' + fmtDate(e.start, false) + ')' : ''}</div>
+              <div style="margin-top:4px">${locBadge(e, 'start')}${e.photo_count ? ` <span class="badge">${e.photo_count} Foto${e.photo_count > 1 ? 's' : ''}</span>` : ''}</div></div>
             <div style="display:flex;gap:8px;align-items:center"><span class="dur" data-since="${e.start}"></span>
               <button class="btn small danger" data-stop="${e.id}" title="Ausstempeln">${icon('stop')}</button></div>
           </li>`).join('')}</ul>` : '<div class="empty">Niemand eingestempelt.</div>'}
@@ -358,10 +460,15 @@ async function pageDashboard(el) {
       <div class="card">
         <h2>Heute erfasst</h2>
         ${d.recent.length ? `<ul class="entry-list">${d.recent.map((e) => `
-          <li><div><div class="when">${esc(e.user_name)}</div><div class="muted small">${esc(e.site_name || 'ohne Objekt')} · ${fmtTime(e.start)}–${e.end ? fmtTime(e.end) : 'läuft'}</div></div>
+          <li><div><div class="when">${esc(e.user_name)}</div><div class="muted small">${esc(e.site_name || 'ohne Objekt')} · ${fmtTime(e.start)}–${e.end ? fmtTime(e.end) : 'läuft'}${e.photo_count ? ' · ' + e.photo_count + ' Foto' + (e.photo_count > 1 ? 's' : '') : ''}</div></div>
           <div class="dur">${fmtDur(e.minutes)}</div></li>`).join('')}</ul>` : '<div class="empty">Heute noch keine Einträge.</div>'}
       </div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <div class="page-head" style="margin-bottom:8px"><h2 style="margin:0">${icon('camera')} Neueste Fotos</h2><a class="btn small" href="#/fotos">Alle Fotos</a></div>
+      ${photoGrid(d.photos, { showDate: true })}
     </div>`;
+  bindPhotoGrid(el, d.photos);
   startLiveDurations(el);
   $$('[data-stop]', el).forEach((b) => b.onclick = async () => {
     if (!confirm('Diesen Mitarbeiter jetzt ausstempeln?')) return;
@@ -380,10 +487,13 @@ function startLiveDurations(root) {
 }
 
 // ================= Seite: Stempeluhr =================
+const PHOTO_LABELS = ['Treppenhaus', 'Eingang', 'Flur', 'Büro', 'Sanitär', 'Küche', 'Fenster'];
+
 async function pageClock(el) {
   const [c] = await Promise.all([api('GET', '/api/clock'), loadSites()]);
   const r = c.running;
   const lastSite = localStorage.getItem('lastSite') || '';
+  const canPhoto = !!(r || c.today.length);
   el.innerHTML = `
     <div class="page-head"><div><h1>Stempeluhr</h1><div class="muted">Hallo ${esc(state.user.name.split(' ')[0])} · ${fmtDate(localDate())}</div></div></div>
     <div class="card clock-card">
@@ -406,14 +516,36 @@ async function pageClock(el) {
         </form>
         <button class="big-btn start" id="clock-btn">${icon('play')} Einstempeln</button>
       `}
+      <div class="geo-hint muted small" id="geo-hint">${icon('pin')} Beim Stempeln wird dein Standort gespeichert.</div>
     </div>
+
+    <div class="card">
+      <h2>${icon('camera')} Fotos der Reinigung</h2>
+      ${canPhoto ? `
+        <p class="muted small" style="margin-top:-6px">Mach nach der Arbeit ein Foto, z. B. vom gereinigten Treppenhaus.</p>
+        <div class="field"><label>Was ist auf dem Foto?</label>
+          <div class="chips" id="photo-chips">${PHOTO_LABELS.map((l, i) => `<button type="button" class="chip ${i === 0 ? 'active' : ''}" data-label="${esc(l)}">${esc(l)}</button>`).join('')}</div>
+          <input id="photo-note" value="${PHOTO_LABELS[0]}" maxlength="300" style="margin-top:8px" placeholder="Beschreibung">
+        </div>
+        <input type="file" id="photo-input" accept="image/*" capture="environment" multiple hidden>
+        <input type="file" id="photo-gallery" accept="image/*" multiple hidden>
+        <div class="photo-actions">
+          <button class="btn primary" id="photo-btn">${icon('camera')} Foto machen</button>
+          <button class="btn" id="gallery-btn">${icon('image')} Aus Galerie</button>
+        </div>
+        <div id="photo-status" class="muted small" style="margin-top:8px"></div>
+        <div id="photo-list" style="margin-top:12px">${c.photos.length ? photoGrid(c.photos, { showWho: false }) : ''}</div>
+      ` : '<div class="empty">Bitte zuerst einstempeln – danach kannst du hier Fotos hochladen.</div>'}
+    </div>
+
     <div class="card">
       <h2>Heute: ${fmtDur(c.todayMinutes)}</h2>
       ${c.today.length ? `<ul class="entry-list">${c.today.map((e) => `
-        <li><div><div class="when">${fmtTime(e.start)} – ${e.end ? fmtTime(e.end) : 'läuft'}</div><div class="muted small">${esc(e.site_name || 'ohne Objekt')}${e.break_minutes ? ' · ' + e.break_minutes + ' Min Pause' : ''}</div></div>
+        <li><div><div class="when">${fmtTime(e.start)} – ${e.end ? fmtTime(e.end) : 'läuft'}</div><div class="muted small">${esc(e.site_name || 'ohne Objekt')}${e.break_minutes ? ' · ' + e.break_minutes + ' Min Pause' : ''}${e.photo_count ? ' · ' + e.photo_count + ' Foto' + (e.photo_count > 1 ? 's' : '') : ''}</div></div>
         <div class="dur">${fmtDur(e.minutes)}</div></li>`).join('')}</ul>` : '<div class="empty">Heute noch nichts erfasst.</div>'}
     </div>`;
 
+  // Laufende Uhr
   const timeEl = $('#clock-time');
   if (r) {
     const startMs = new Date(r.start + ':00').getTime();
@@ -431,23 +563,64 @@ async function pageClock(el) {
     timers.push(setInterval(() => { timeEl.textContent = new Date().toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' }); }, 10000));
   }
 
+  // Ein-/Ausstempeln mit Standort
   $('#clock-btn').onclick = async () => {
     const btn = $('#clock-btn');
+    const hint = $('#geo-hint');
     const data = Object.fromEntries(new FormData($('#clock-form')));
     if (!r && !data.site_id && state.sites.length && !confirm('Ohne Objekt einstempeln?')) return;
     btn.disabled = true;
+    const label = btn.innerHTML;
+    btn.textContent = 'Standort wird ermittelt …';
+    const loc = await getLocation();
+    if (loc.error) {
+      hint.innerHTML = `<span style="color:var(--warn)">${icon('pin')} ${esc(loc.error)} – es wird ohne Standort gestempelt.</span>`;
+    }
+    btn.textContent = r ? 'Wird ausgestempelt …' : 'Wird eingestempelt …';
+    const location = loc.error ? null : loc;
     try {
       if (r) {
-        await api('POST', '/api/clock/out', { break_minutes: Number(data.break_minutes || 0), note: data.note });
-        toast('Ausgestempelt – schönen Feierabend!');
+        await api('POST', '/api/clock/out', { break_minutes: Number(data.break_minutes || 0), note: data.note, location });
+        toast('Ausgestempelt – schönen Feierabend!' + (location ? '' : ' (ohne Standort)'));
       } else {
-        await api('POST', '/api/clock/in', { site_id: data.site_id || null });
+        await api('POST', '/api/clock/in', { site_id: data.site_id || null, location });
         if (data.site_id) localStorage.setItem('lastSite', data.site_id);
-        toast('Eingestempelt');
+        toast('Eingestempelt' + (location ? ' – Standort gespeichert' : ' (ohne Standort)'));
       }
       render();
-    } catch (e) { toast(e.message, true); btn.disabled = false; }
+    } catch (e) { toast(e.message, true); btn.disabled = false; btn.innerHTML = label; }
   };
+
+  // Fotos
+  if (canPhoto) {
+    bindPhotoGrid(el, c.photos);
+    $$('#photo-chips .chip').forEach((ch) => ch.onclick = () => {
+      $$('#photo-chips .chip').forEach((x) => x.classList.remove('active'));
+      ch.classList.add('active');
+      $('#photo-note').value = ch.dataset.label;
+    });
+    $('#photo-btn').onclick = () => $('#photo-input').click();
+    $('#gallery-btn').onclick = () => $('#photo-gallery').click();
+    const onFiles = async (input) => {
+      const files = [...input.files];
+      input.value = '';
+      if (!files.length) return;
+      const status = $('#photo-status');
+      $('#photo-btn').disabled = $('#gallery-btn').disabled = true;
+      status.textContent = files.length > 1 ? `${files.length} Fotos werden hochgeladen …` : 'Foto wird hochgeladen …';
+      try {
+        const n = await uploadPhotos(files, $('#photo-note').value);
+        toast(n > 1 ? `${n} Fotos hochgeladen` : 'Foto hochgeladen');
+        render();
+      } catch (e) {
+        status.textContent = '';
+        toast(e.message, true);
+        $('#photo-btn').disabled = $('#gallery-btn').disabled = false;
+      }
+    };
+    $('#photo-input').onchange = (e) => onFiles(e.target);
+    $('#photo-gallery').onchange = (e) => onFiles(e.target);
+  }
 }
 
 // ================= Zeit-Eintrag (Formular) =================
@@ -457,7 +630,16 @@ function entryModal(entry, onDone, { asEmployee = false } = {}) {
   const begin = e.start ? e.start.slice(11, 16) : '';
   const end = e.end ? e.end.slice(11, 16) : '';
   const running = entry && !entry.end;
+  const details = entry && !asEmployee ? `
+    <div class="entry-details">
+      <div class="row">
+        <div><div class="muted small">Standort Einstempeln</div>${entry.source === 'clock' ? locBadge(entry, 'start') : '<span class="muted small">nachgetragen</span>'}</div>
+        <div><div class="muted small">Standort Ausstempeln</div>${entry.source === 'clock' && entry.end ? locBadge(entry, 'end') : '–'}</div>
+      </div>
+      <div id="entry-photos" style="margin-top:10px">${entry.photo_count ? '<span class="muted small">Fotos werden geladen …</span>' : '<span class="muted small">Keine Fotos zu diesem Einsatz.</span>'}</div>
+    </div>` : '';
   const form = openModal(entry ? 'Eintrag bearbeiten' : 'Zeit eintragen', `
+    ${details}
     ${asEmployee ? '' : `<div class="field"><label>Mitarbeiter</label><select name="user_id" required>${userOptions(e.user_id, { emptyLabel: '– wählen –' })}</select></div>`}
     <div class="field"><label>Objekt / Kunde</label><select name="site_id">${siteOptions(e.site_id)}</select></div>
     <div class="row3">
@@ -478,7 +660,7 @@ function entryModal(entry, onDone, { asEmployee = false } = {}) {
       if (!d.end && !running) throw new Error('Ende angeben');
       const start = `${d.date}T${d.begin}`;
       let endDt = null;
-      if (d.end) endDt = `${d.end <= d.begin ? addDays(d.date, 1) : d.date}T${d.end}`;
+      if (d.end) endDt = `${d.end < d.begin ? addDays(d.date, 1) : d.date}T${d.end}`;
       const body = { site_id: d.site_id || null, start, end: endDt, break_minutes: Number(d.break_minutes || 0), note: d.note };
       if (!asEmployee) body.user_id = Number(d.user_id);
       if (entry) await api('PUT', `/api/entries/${entry.id}`, body);
@@ -492,11 +674,19 @@ function entryModal(entry, onDone, { asEmployee = false } = {}) {
     const b = form.begin.value, en = form.end.value;
     if (!b || !en) { $('#calc').value = '–'; return; }
     let m = (Number(en.slice(0, 2)) * 60 + Number(en.slice(3))) - (Number(b.slice(0, 2)) * 60 + Number(b.slice(3)));
-    if (m <= 0) m += 1440;
+    if (m < 0) m += 1440;
     $('#calc').value = fmtDur(m - Number(form.break_minutes.value || 0));
   };
   ['begin', 'end', 'break_minutes'].forEach((n) => form[n].addEventListener('input', calc));
   calc();
+  if (entry && entry.photo_count && !asEmployee) {
+    api('GET', `/api/photos?entry_id=${entry.id}`).then((photos) => {
+      const box = $('#entry-photos');
+      if (!box) return;
+      box.innerHTML = photoGrid(photos, { showWho: false });
+      bindPhotoGrid(box, photos, onDone);
+    }).catch(() => {});
+  }
 }
 
 // ================= Seite: Zeiten (Admin) =================
@@ -530,7 +720,7 @@ async function pageEntries(el, params) {
       </form>
       ${entries.length ? `
       <div class="table-wrap"><table>
-        <thead><tr><th>Datum</th><th>Mitarbeiter</th><th class="hide-mobile">Objekt</th><th>Zeit</th><th class="right hide-mobile">Pause</th><th class="right">Dauer</th><th class="hide-mobile">Notiz</th><th></th></tr></thead>
+        <thead><tr><th>Datum</th><th>Mitarbeiter</th><th class="hide-mobile">Objekt</th><th>Zeit</th><th class="right hide-mobile">Pause</th><th class="right">Dauer</th><th class="hide-mobile">Standort Ein / Aus · Fotos</th><th class="hide-mobile hide-mid">Notiz</th><th></th></tr></thead>
         <tbody>${entries.map((e) => `
           <tr>
             <td class="nowrap">${fmtDate(e.start)}</td>
@@ -539,10 +729,11 @@ async function pageEntries(el, params) {
             <td class="nowrap num">${fmtTime(e.start)} – ${endLabel(e)}</td>
             <td class="right num hide-mobile">${e.break_minutes ? e.break_minutes + ' Min' : '–'}</td>
             <td class="right num nowrap"><strong>${fmtDur(e.minutes)}</strong></td>
-            <td class="hide-mobile small muted" style="max-width:200px">${esc(e.note)}</td>
+            <td class="hide-mobile loc-cell">${e.source === 'clock' ? `${locBadge(e, 'start')} ${e.end ? locBadge(e, 'end') : ''}` : '<span class="muted small">nachgetragen</span>'}${e.photo_count ? ` <span class="badge brand">${icon('camera')}${e.photo_count}</span>` : ''}</td>
+            <td class="hide-mobile hide-mid small muted" style="max-width:200px">${esc(e.note)}</td>
             <td class="right nowrap">${e.running ? `<button class="btn small danger" data-stop="${e.id}" title="Ausstempeln">${icon('stop')}</button> ` : ''}<button class="btn small" data-edit="${e.id}">Bearbeiten</button></td>
           </tr>`).join('')}</tbody>
-        <tfoot><tr><td colspan="5" class="hide-mobile">Summe</td><td colspan="3" class="hide-mobile num">${fmtDur(total)}</td></tr></tfoot>
+        <tfoot><tr><td colspan="5" class="hide-mobile">Summe</td><td colspan="4" class="hide-mobile num">${fmtDur(total)}</td></tr></tfoot>
       </table></div>` : '<div class="empty">Keine Einträge im gewählten Zeitraum.</div>'}
     </div>`;
 
@@ -639,7 +830,8 @@ async function pageSites(el) {
           <tr class="${s.active ? '' : 'inactive'}">
             <td><strong>${esc(s.name)}</strong>${s.notes ? `<div class="muted small">${esc(s.notes)}</div>` : ''}</td>
             <td>${esc(s.customer || '–')}</td>
-            <td class="hide-mobile">${s.address ? `<a href="https://maps.google.com/?q=${encodeURIComponent(s.address)}" target="_blank" rel="noopener">${esc(s.address)}</a>` : '–'}</td>
+            <td class="hide-mobile">${s.address ? `<a href="https://maps.google.com/?q=${encodeURIComponent(s.address)}" target="_blank" rel="noopener">${esc(s.address)}</a>` : '–'}
+              ${s.lat !== null && s.lat !== undefined ? ' <span class="badge ok" title="GPS-Position hinterlegt">GPS</span>' : ' <span class="badge" title="Keine GPS-Position – Entfernung beim Stempeln kann nicht geprüft werden">kein GPS</span>'}</td>
             <td>${s.active ? '<span class="badge ok">aktiv</span>' : '<span class="badge">inaktiv</span>'}</td>
             <td class="right"><button class="btn small" data-edit="${s.id}">Bearbeiten</button></td>
           </tr>`).join('')}</tbody>
@@ -651,19 +843,77 @@ async function pageSites(el) {
 
 function siteModal(s) {
   const x = s || { active: 1 };
-  openModal(s ? 'Objekt bearbeiten' : 'Neues Objekt', `
+  const form = openModal(s ? 'Objekt bearbeiten' : 'Neues Objekt', `
     <div class="field"><label>Bezeichnung</label><input name="name" value="${esc(x.name || '')}" placeholder="z. B. Bürogebäude Hauptstraße" required></div>
     <div class="field"><label>Kunde</label><input name="customer" value="${esc(x.customer || '')}"></div>
     <div class="field"><label>Adresse</label><input name="address" value="${esc(x.address || '')}"></div>
+    <div class="field">
+      <label>GPS-Position des Objekts <span class="muted small">(für die Prüfung „am Objekt“ beim Stempeln)</span></label>
+      <div class="row">
+        <input name="lat" inputmode="decimal" placeholder="Breitengrad, z. B. 52.5200" value="${x.lat ?? ''}">
+        <input name="lng" inputmode="decimal" placeholder="Längengrad, z. B. 13.4050" value="${x.lng ?? ''}">
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+        <button type="button" class="btn small" id="site-here">${icon('pin')} Aktuellen Standort übernehmen</button>
+        ${x.lat !== null && x.lat !== undefined ? `<a class="btn small" href="${mapsUrl(x.lat, x.lng)}" target="_blank" rel="noopener">Auf Karte zeigen</a>` : ''}
+      </div>
+      <div class="muted small" style="margin-top:6px">Tipp: Beim ersten Besuch vor Ort auf „Aktuellen Standort übernehmen“ tippen – oder Koordinaten aus Google Maps kopieren (Rechtsklick auf den Ort).</div>
+    </div>
     <div class="field"><label>Notizen (Schlüssel, Zugangscode, Besonderheiten …)</label><textarea name="notes">${esc(x.notes || '')}</textarea></div>
     <label class="check"><input type="checkbox" name="active" ${x.active ? 'checked' : ''}> Aktiv</label>
   `, {
     onSave: async (d) => {
+      // Koordinaten aus Google Maps können als "52.52, 13.40" in einem Feld eingefügt werden
+      const both = String(d.lat).match(/^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/);
+      if (both) { d.lat = both[1]; d.lng = both[2]; }
+      d.lat = String(d.lat).trim(); d.lng = String(d.lng).trim();
+      if ((d.lat === '') !== (d.lng === '')) throw new Error('Bitte Breiten- und Längengrad angeben');
       if (s) await api('PUT', `/api/sites/${s.id}`, d); else await api('POST', '/api/sites', d);
       toast('Gespeichert'); render();
     },
     onDelete: s ? async () => { await api('DELETE', `/api/sites/${s.id}`); toast('Gelöscht'); render(); } : null
   });
+  $('#site-here').onclick = async (e) => {
+    const b = e.currentTarget;
+    b.disabled = true; b.textContent = 'Standort wird ermittelt …';
+    const loc = await getLocation();
+    b.disabled = false; b.innerHTML = `${icon('pin')} Aktuellen Standort übernehmen`;
+    if (loc.error) return toast(loc.error, true);
+    form.lat.value = loc.lat.toFixed(6); form.lng.value = loc.lng.toFixed(6);
+    toast(`Standort übernommen (±${loc.accuracy} m)`);
+  };
+}
+
+// ================= Seite: Fotos (Admin) =================
+async function pagePhotos(el, params) {
+  await Promise.all([loadUsers(), loadSites()]);
+  const f = {
+    from: params.get('from') || addDays(localDate(), -6),
+    to: params.get('to') || localDate(),
+    user_id: params.get('user_id') || '',
+    site_id: params.get('site_id') || ''
+  };
+  const qs = new URLSearchParams(Object.entries(f).filter(([, v]) => v)).toString();
+  const photos = await api('GET', '/api/photos?limit=500&' + qs);
+  const byDay = {};
+  photos.forEach((p) => { (byDay[p.taken_at.slice(0, 10)] ||= []).push(p); });
+  el.innerHTML = `
+    <div class="page-head"><div><h1>Fotos</h1><div class="muted">${photos.length} Fotos · Nachweis der Reinigung</div></div></div>
+    <div class="card">
+      <form class="filters" id="filters">
+        <div class="field narrow"><label>Von</label><input type="date" name="from" value="${f.from}"></div>
+        <div class="field narrow"><label>Bis</label><input type="date" name="to" value="${f.to}"></div>
+        <div class="field"><label>Mitarbeiter</label><select name="user_id">${userOptions(f.user_id, { emptyLabel: 'Alle' })}</select></div>
+        <div class="field"><label>Objekt</label><select name="site_id">${siteOptions(f.site_id, { includeInactive: true, emptyLabel: 'Alle' })}</select></div>
+      </form>
+      ${photos.length ? Object.entries(byDay).map(([day, list]) => `
+        <h3 style="margin-top:16px">${fmtDate(day)}</h3>
+        ${Object.entries(list.reduce((acc, p) => { (acc[p.site_name || 'ohne Objekt'] ||= []).push(p); return acc; }, {})).map(([site, ps]) => `
+          <div class="muted small" style="margin:6px 0">${icon('building')} ${esc(site)}</div>${photoGrid(ps)}`).join('')}
+      `).join('') : '<div class="empty">Keine Fotos im gewählten Zeitraum.</div>'}
+    </div>`;
+  $('#filters').onchange = () => go('fotos', Object.fromEntries([...new FormData($('#filters'))].filter(([, v]) => v)));
+  bindPhotoGrid(el, photos);
 }
 
 // ================= Seite: Auswertung =================
@@ -786,7 +1036,7 @@ async function pageMyEntries(el, params) {
         </div></div>
       ${entries.length ? `<ul class="entry-list">${entries.map((e) => `
         <li><div><div class="when">${fmtDate(e.start)}</div>
-          <div class="muted small">${fmtTime(e.start)} – ${e.end ? fmtTime(e.end) : 'läuft'} · ${esc(e.site_name || 'ohne Objekt')}${e.break_minutes ? ' · ' + e.break_minutes + ' Min Pause' : ''}${e.source === 'manual' ? ' · nachgetragen' : ''}</div>
+          <div class="muted small">${fmtTime(e.start)} – ${e.end ? fmtTime(e.end) : 'läuft'} · ${esc(e.site_name || 'ohne Objekt')}${e.break_minutes ? ' · ' + e.break_minutes + ' Min Pause' : ''}${e.source === 'manual' ? ' · nachgetragen' : ''}${e.photo_count ? ' · ' + e.photo_count + ' Foto' + (e.photo_count > 1 ? 's' : '') : ''}</div>
           ${e.note ? `<div class="small">${esc(e.note)}</div>` : ''}</div>
           <div class="dur">${fmtDur(e.minutes)}</div></li>`).join('')}</ul>` : '<div class="empty">Keine Einträge in diesem Monat.</div>'}
       ${!canAdd ? '<p class="muted small">Zeit vergessen zu stempeln? Bitte kurz beim Chef melden – der kann sie nachtragen.</p>' : ''}

@@ -64,11 +64,40 @@ CREATE TABLE IF NOT EXISTS sessions (
   expires_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS photos (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entry_id INTEGER REFERENCES entries(id) ON DELETE SET NULL,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  site_id INTEGER REFERENCES sites(id) ON DELETE SET NULL,
+  filename TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  lat REAL, lng REAL, accuracy REAL,
+  taken_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_photos_entry ON photos(entry_id);
+CREATE INDEX IF NOT EXISTS idx_photos_taken ON photos(taken_at);
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
 `);
+
+// Migrationen: neue Spalten für Standort (bestehende Datenbanken werden ergänzt)
+function addColumn(table, col, def) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+  if (!cols.includes(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
+}
+for (const p of ['start', 'end']) {
+  addColumn('entries', `${p}_lat`, 'REAL');
+  addColumn('entries', `${p}_lng`, 'REAL');
+  addColumn('entries', `${p}_acc`, 'REAL');
+}
+addColumn('sites', 'lat', 'REAL');
+addColumn('sites', 'lng', 'REAL');
+
+const PHOTO_DIR = path.join(DATA_DIR, 'photos');
+fs.mkdirSync(PHOTO_DIR, { recursive: true });
 
 const DEFAULT_SETTINGS = {
   company_name: 'Kayron Reinigung',
@@ -123,6 +152,23 @@ function workedMinutes(e) {
   return Math.max(0, minutesBetween(e.start, end) - (e.break_minutes || 0));
 }
 
+// Standort aus Anfrage lesen: { lat, lng, accuracy } oder null
+function parseLocation(loc) {
+  if (!loc || typeof loc !== 'object') return null;
+  const lat = Number(loc.lat), lng = Number(loc.lng), acc = Number(loc.accuracy);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
+  return { lat, lng, accuracy: Number.isFinite(acc) ? Math.round(acc) : null };
+}
+
+// Entfernung in Metern (Haversine)
+function distanceM(lat1, lng1, lat2, lng2) {
+  if ([lat1, lng1, lat2, lng2].some((v) => v === null || v === undefined)) return null;
+  const R = 6371000, rad = Math.PI / 180;
+  const dLat = (lat2 - lat1) * rad, dLng = (lng2 - lng1) * rad;
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLng / 2) ** 2;
+  return Math.round(2 * R * Math.asin(Math.sqrt(a)));
+}
+
 function publicUser(u) {
   if (!u) return null;
   const { password_hash, ...rest } = u;
@@ -154,12 +200,12 @@ function send(res, status, body, headers = {}) {
   res.end(isString ? body : JSON.stringify(body));
 }
 
-async function readBody(req) {
+async function readBody(req, limit = 1_000_000) {
   let size = 0;
   const chunks = [];
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 1_000_000) throw new HttpError(413, 'Anfrage zu groß');
+    if (size > limit) throw new HttpError(413, 'Anfrage zu groß');
     chunks.push(chunk);
   }
   if (!chunks.length) return {};
@@ -203,7 +249,7 @@ const routes = [];
 function route(method, pattern, handler, opts = {}) {
   const keys = [];
   const re = new RegExp('^' + pattern.replace(/:(\w+)/g, (_, k) => { keys.push(k); return '([^/]+)'; }) + '$');
-  routes.push({ method, re, keys, handler, auth: opts.auth ?? 'user' });
+  routes.push({ method, re, keys, handler, auth: opts.auth ?? 'user', bodyLimit: opts.bodyLimit });
 }
 
 // ----- Setup & Auth -----
@@ -342,14 +388,16 @@ route('GET', '/api/sites', (ctx) => {
 function siteFields(b) {
   return {
     name: str(b.name, 150), customer: str(b.customer, 150), address: str(b.address, 300),
-    notes: str(b.notes, 2000), active: b.active === false || b.active === 0 ? 0 : 1
+    notes: str(b.notes, 2000), active: b.active === false || b.active === 0 ? 0 : 1,
+    lat: b.lat === '' || b.lat === null || b.lat === undefined || !Number.isFinite(Number(b.lat)) ? null : Number(b.lat),
+    lng: b.lng === '' || b.lng === null || b.lng === undefined || !Number.isFinite(Number(b.lng)) ? null : Number(b.lng)
   };
 }
 route('POST', '/api/sites', (ctx) => {
   const f = siteFields(ctx.body);
   if (!f.name) throw new HttpError(400, 'Name des Objekts erforderlich');
-  const r = db.prepare('INSERT INTO sites (name, customer, address, notes, active) VALUES (?, ?, ?, ?, ?)')
-    .run(f.name, f.customer, f.address, f.notes, f.active);
+  const r = db.prepare('INSERT INTO sites (name, customer, address, notes, active, lat, lng) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(f.name, f.customer, f.address, f.notes, f.active, f.lat, f.lng);
   return db.prepare('SELECT * FROM sites WHERE id = ?').get(Number(r.lastInsertRowid));
 }, { auth: 'admin' });
 
@@ -359,8 +407,8 @@ route('PUT', '/api/sites/:id', (ctx) => {
   if (!existing) throw new HttpError(404, 'Objekt nicht gefunden');
   const f = siteFields({ ...existing, ...ctx.body });
   if (!f.name) throw new HttpError(400, 'Name des Objekts erforderlich');
-  db.prepare('UPDATE sites SET name=?, customer=?, address=?, notes=?, active=? WHERE id=?')
-    .run(f.name, f.customer, f.address, f.notes, f.active, id);
+  db.prepare('UPDATE sites SET name=?, customer=?, address=?, notes=?, active=?, lat=?, lng=? WHERE id=?')
+    .run(f.name, f.customer, f.address, f.notes, f.active, f.lat, f.lng, id);
   return db.prepare('SELECT * FROM sites WHERE id = ?').get(id);
 }, { auth: 'admin' });
 
@@ -374,11 +422,16 @@ route('DELETE', '/api/sites/:id', (ctx) => {
 
 // ----- Zeiteinträge -----
 const ENTRY_SELECT = `
-  SELECT e.*, u.name AS user_name, s.name AS site_name
+  SELECT e.*, u.name AS user_name, s.name AS site_name, s.lat AS site_lat, s.lng AS site_lng,
+    (SELECT COUNT(*) FROM photos p WHERE p.entry_id = e.id) AS photo_count
   FROM entries e JOIN users u ON u.id = e.user_id LEFT JOIN sites s ON s.id = e.site_id`;
 
 function decorate(e) {
-  return { ...e, minutes: workedMinutes(e), running: !e.end };
+  return {
+    ...e, minutes: workedMinutes(e), running: !e.end,
+    start_distance: distanceM(e.start_lat, e.start_lng, e.site_lat, e.site_lng),
+    end_distance: distanceM(e.end_lat, e.end_lng, e.site_lat, e.site_lng)
+  };
 }
 
 function queryEntries({ from, to, userId, siteId }) {
@@ -445,7 +498,9 @@ route('PUT', '/api/entries/:id', (ctx) => {
 }, { auth: 'admin' });
 
 route('DELETE', '/api/entries/:id', (ctx) => {
-  db.prepare('DELETE FROM entries WHERE id = ?').run(Number(ctx.params.id));
+  const id = Number(ctx.params.id);
+  for (const p of db.prepare('SELECT * FROM photos WHERE entry_id = ?').all(id)) deletePhoto(p);
+  db.prepare('DELETE FROM entries WHERE id = ?').run(id);
   return { ok: true };
 }, { auth: 'admin' });
 
@@ -461,7 +516,8 @@ route('GET', '/api/clock', (ctx) => {
   return {
     running: r ? decorate(r) : null,
     todayMinutes: todays.reduce((s, e) => s + e.minutes, 0),
-    today: todays
+    today: todays,
+    photos: queryPhotos({ from: today, to: today, userId: ctx.user.id })
   };
 });
 
@@ -469,8 +525,10 @@ route('POST', '/api/clock/in', (ctx) => {
   if (runningEntry(ctx.user.id)) throw new HttpError(400, 'Du bist bereits eingestempelt');
   const siteId = ctx.body.site_id ? Number(ctx.body.site_id) : null;
   if (siteId && !db.prepare('SELECT 1 FROM sites WHERE id = ? AND active = 1').get(siteId)) throw new HttpError(400, 'Objekt nicht gefunden');
-  db.prepare(`INSERT INTO entries (user_id, site_id, start, note, source) VALUES (?, ?, ?, ?, 'clock')`)
-    .run(ctx.user.id, siteId, nowLocal(), str(ctx.body.note, 1000));
+  const loc = parseLocation(ctx.body.location);
+  db.prepare(`INSERT INTO entries (user_id, site_id, start, note, source, start_lat, start_lng, start_acc)
+    VALUES (?, ?, ?, ?, 'clock', ?, ?, ?)`)
+    .run(ctx.user.id, siteId, nowLocal(), str(ctx.body.note, 1000), loc?.lat ?? null, loc?.lng ?? null, loc?.accuracy ?? null);
   return { ok: true };
 });
 
@@ -481,8 +539,9 @@ route('POST', '/api/clock/out', (ctx) => {
   const dur = Math.max(0, minutesBetween(r.start, end));
   const brk = Math.min(Math.max(0, Math.round(num(ctx.body.break_minutes))), dur);
   const note = ctx.body.note !== undefined ? str(ctx.body.note, 1000) : r.note;
-  db.prepare(`UPDATE entries SET end=?, break_minutes=?, note=?, updated_at=datetime('now') WHERE id=?`)
-    .run(end, brk, note, r.id);
+  const loc = parseLocation(ctx.body.location);
+  db.prepare(`UPDATE entries SET end=?, break_minutes=?, note=?, end_lat=?, end_lng=?, end_acc=?, updated_at=datetime('now') WHERE id=?`)
+    .run(end, brk, note, loc?.lat ?? null, loc?.lng ?? null, loc?.accuracy ?? null, r.id);
   return { ok: true };
 });
 
@@ -494,6 +553,100 @@ route('POST', '/api/entries/:id/stop', (ctx) => {
   db.prepare(`UPDATE entries SET end=?, updated_at=datetime('now') WHERE id=?`).run(nowLocal(), id);
   return { ok: true };
 }, { auth: 'admin' });
+
+// ----- Fotos (Nachweis der Reinigung) -----
+const PHOTO_SELECT = `
+  SELECT p.id, p.entry_id, p.user_id, p.site_id, p.note, p.lat, p.lng, p.accuracy, p.taken_at,
+    u.name AS user_name, s.name AS site_name
+  FROM photos p JOIN users u ON u.id = p.user_id LEFT JOIN sites s ON s.id = p.site_id`;
+
+function queryPhotos({ from, to, userId, siteId, entryId, limit }) {
+  const where = [], args = [];
+  if (from) { where.push('p.taken_at >= ?'); args.push(from + 'T00:00'); }
+  if (to) { where.push('p.taken_at <= ?'); args.push(to + 'T23:59'); }
+  if (userId) { where.push('p.user_id = ?'); args.push(userId); }
+  if (siteId) { where.push('p.site_id = ?'); args.push(siteId); }
+  if (entryId) { where.push('p.entry_id = ?'); args.push(entryId); }
+  let sql = PHOTO_SELECT + (where.length ? ' WHERE ' + where.join(' AND ') : '') + ' ORDER BY p.taken_at DESC, p.id DESC';
+  if (limit) sql += ' LIMIT ' + Number(limit);
+  return db.prepare(sql).all(...args);
+}
+
+function deletePhoto(p) {
+  try { fs.unlinkSync(path.join(PHOTO_DIR, path.basename(p.filename))); } catch { /* schon weg */ }
+  db.prepare('DELETE FROM photos WHERE id = ?').run(p.id);
+}
+
+const IMAGE_TYPES = {
+  jpg: { mime: 'image/jpeg', magic: (b) => b[0] === 0xff && b[1] === 0xd8 },
+  png: { mime: 'image/png', magic: (b) => b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47 },
+  webp: { mime: 'image/webp', magic: (b) => b.slice(0, 4).toString() === 'RIFF' && b.slice(8, 12).toString() === 'WEBP' }
+};
+
+route('GET', '/api/photos', (ctx) => {
+  const f = entryFilters(ctx);
+  const entryId = ctx.query.get('entry_id') ? Number(ctx.query.get('entry_id')) : null;
+  const limit = Math.min(500, Number(ctx.query.get('limit')) || 200);
+  return queryPhotos({ ...f, entryId, limit });
+});
+
+route('POST', '/api/photos', (ctx) => {
+  const b = ctx.body;
+  const m = /^data:image\/(jpeg|png|webp);base64,(.+)$/s.exec(String(b.image || ''));
+  if (!m) throw new HttpError(400, 'Bitte ein Bild (JPG, PNG oder WebP) auswählen');
+  const ext = m[1] === 'jpeg' ? 'jpg' : m[1];
+  const buf = Buffer.from(m[2], 'base64');
+  if (buf.length < 100 || !IMAGE_TYPES[ext].magic(buf)) throw new HttpError(400, 'Ungültige Bilddatei');
+
+  // Eintrag zuordnen: angegebener Eintrag, sonst laufender, sonst letzter Eintrag von heute
+  let entry = null;
+  if (b.entry_id) {
+    entry = db.prepare('SELECT * FROM entries WHERE id = ?').get(Number(b.entry_id));
+    if (!entry) throw new HttpError(404, 'Eintrag nicht gefunden');
+    if (ctx.user.role !== 'admin' && entry.user_id !== ctx.user.id) throw new HttpError(403, 'Keine Berechtigung');
+  } else {
+    entry = runningEntry(ctx.user.id) ||
+      db.prepare('SELECT * FROM entries WHERE user_id = ? AND start >= ? ORDER BY start DESC LIMIT 1')
+        .get(ctx.user.id, nowLocal().slice(0, 10) + 'T00:00');
+  }
+  if (!entry && ctx.user.role !== 'admin') throw new HttpError(400, 'Bitte zuerst einstempeln, dann Fotos hochladen');
+
+  const filename = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}.${ext}`;
+  fs.writeFileSync(path.join(PHOTO_DIR, filename), buf);
+  const loc = parseLocation(b.location);
+  const r = db.prepare(`INSERT INTO photos (entry_id, user_id, site_id, filename, note, lat, lng, accuracy, taken_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    entry ? entry.id : null, entry ? entry.user_id : ctx.user.id, entry ? entry.site_id : null,
+    filename, str(b.note, 300), loc?.lat ?? null, loc?.lng ?? null, loc?.accuracy ?? null, nowLocal());
+  return db.prepare(PHOTO_SELECT + ' WHERE p.id = ?').get(Number(r.lastInsertRowid));
+}, { bodyLimit: 15_000_000 });
+
+route('GET', '/api/photos/:id/file', (ctx) => {
+  const p = db.prepare('SELECT * FROM photos WHERE id = ?').get(Number(ctx.params.id));
+  if (!p) throw new HttpError(404, 'Foto nicht gefunden');
+  if (ctx.user.role !== 'admin' && p.user_id !== ctx.user.id) throw new HttpError(403, 'Keine Berechtigung');
+  const file = path.join(PHOTO_DIR, path.basename(p.filename));
+  if (!fs.existsSync(file)) throw new HttpError(404, 'Datei fehlt');
+  const ext = path.extname(file).slice(1);
+  ctx.res.writeHead(200, {
+    'Content-Type': IMAGE_TYPES[ext]?.mime || 'application/octet-stream',
+    'Cache-Control': 'private, max-age=86400',
+    'X-Content-Type-Options': 'nosniff'
+  });
+  fs.createReadStream(file).pipe(ctx.res);
+  return undefined;
+});
+
+route('DELETE', '/api/photos/:id', (ctx) => {
+  const p = db.prepare('SELECT * FROM photos WHERE id = ?').get(Number(ctx.params.id));
+  if (!p) throw new HttpError(404, 'Foto nicht gefunden');
+  // Mitarbeiter dürfen eigene Fotos nur am selben Tag löschen
+  if (ctx.user.role !== 'admin' && (p.user_id !== ctx.user.id || p.taken_at.slice(0, 10) !== nowLocal().slice(0, 10))) {
+    throw new HttpError(403, 'Keine Berechtigung');
+  }
+  deletePhoto(p);
+  return { ok: true };
+});
 
 // ----- Übersicht & Auswertung -----
 route('GET', '/api/dashboard', () => {
@@ -509,7 +662,8 @@ route('GET', '/api/dashboard', () => {
     monthMinutes: monthEntries.reduce((s, e) => s + e.minutes, 0),
     activeEmployees: db.prepare("SELECT COUNT(*) AS c FROM users WHERE active = 1").get().c,
     activeSites: db.prepare('SELECT COUNT(*) AS c FROM sites WHERE active = 1').get().c,
-    recent: todays.slice(0, 15)
+    recent: todays.slice(0, 15),
+    photos: queryPhotos({ limit: 12 })
   };
 }, { auth: 'admin' });
 
@@ -586,7 +740,8 @@ route('GET', '/api/export.csv', (ctx) => {
     return /[;"\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
   };
   const de = (n) => n.toFixed(2).replace('.', ',');
-  const lines = [['Datum', 'Mitarbeiter', 'Objekt', 'Beginn', 'Ende', 'Pause (Min)', 'Stunden', 'Stundenlohn', 'Betrag', 'Notiz'].join(';')];
+  const lines = [['Datum', 'Mitarbeiter', 'Objekt', 'Beginn', 'Ende', 'Pause (Min)', 'Stunden', 'Stundenlohn', 'Betrag', 'Notiz', 'Fotos', 'Standort Beginn', 'Standort Ende'].join(';')];
+  const geo = (lat, lng) => (lat === null || lat === undefined ? '' : `https://www.google.com/maps?q=${lat},${lng}`);
   for (const e of entries) {
     const hours = e.minutes / 60;
     const rate = users.get(e.user_id) || 0;
@@ -594,7 +749,8 @@ route('GET', '/api/export.csv', (ctx) => {
     lines.push([
       d.split('-').reverse().join('.'), e.user_name, e.site_name || '', t,
       e.end ? (e.end.slice(0, 10) === d ? e.end.slice(11) : e.end.replace('T', ' ')) : 'läuft',
-      e.break_minutes, de(hours), de(rate), de(hours * rate), e.note
+      e.break_minutes, de(hours), de(rate), de(hours * rate), e.note, e.photo_count || 0,
+      geo(e.start_lat, e.start_lng), geo(e.end_lat, e.end_lng)
     ].map(esc).join(';'));
   }
   const name = `zeiten_${entryFilters(ctx).from || 'alle'}_${entryFilters(ctx).to || ''}.csv`.replace(/_\.csv$/, '.csv');
@@ -614,7 +770,8 @@ route('GET', '/api/backup', (ctx) => {
     settings: getSettings(),
     users: db.prepare('SELECT * FROM users').all().map(publicUser),
     sites: db.prepare('SELECT * FROM sites').all(),
-    entries: db.prepare('SELECT * FROM entries').all()
+    entries: db.prepare('SELECT * FROM entries').all(),
+    photos: db.prepare('SELECT * FROM photos').all()
   };
   ctx.res.writeHead(200, {
     'Content-Type': 'application/json; charset=utf-8',
@@ -664,7 +821,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method !== 'GET' && !String(req.headers['content-type'] || '').includes('application/json')) {
       throw new HttpError(415, 'Content-Type application/json erforderlich');
     }
-    const body = req.method === 'GET' ? {} : await readBody(req);
+    const body = req.method === 'GET' ? {} : await readBody(req, r.bodyLimit);
     const result = await r.handler({ req, res, params, query: url.searchParams, body, user });
     if (result !== undefined && !res.headersSent) send(res, 200, result);
   } catch (err) {
