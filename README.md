@@ -60,6 +60,28 @@ und ihnen Benutzername + PIN geben.
 | `PORT`     | `3000`    | Port des Webservers                |
 | `DATA_DIR` | `./data`  | Ordner für die Datenbank (`kayron.db`) |
 
+## Online stellen mit Railway (empfohlen, ca. 5 $/Monat)
+
+1. Auf <https://railway.com> mit dem GitHub-Konto anmelden und den **Hobby-Plan** wählen.
+2. **New Project → Deploy from GitHub repo →** `Kayron-app` auswählen.
+   Railway erkennt das `Dockerfile` automatisch und baut die App.
+3. Im Service unter **Settings → Source → Branch** den Branch mit der App wählen
+   (solange sie noch nicht auf `main` liegt).
+4. **Volume anlegen** (sonst gehen bei jedem Update alle Daten verloren!):
+   Rechtsklick auf den Service → *Attach Volume* → Mount Path: **`/data`**
+5. Unter **Settings → Networking → Generate Domain** klicken. Du bekommst eine Adresse wie
+   `kayron-app-production.up.railway.app` – mit HTTPS, damit funktionieren Standort, Kamera und Offline-Modus.
+6. Adresse im Browser öffnen → Chef-Konto anlegen → Mitarbeiter und Objekte anlegen.
+
+Optional eigene Adresse: unter *Networking → Custom Domain* z. B. `zeiten.kayron-reinigung.de` eintragen und
+den angezeigten CNAME-Eintrag bei deinem Domain-Anbieter setzen.
+
+### Auf dem Handy als App installieren
+- **iPhone (Safari):** Adresse öffnen → Teilen-Symbol → *Zum Home-Bildschirm*
+- **Android (Chrome):** Adresse öffnen → Menü ⋮ → *App installieren* bzw. *Zum Startbildschirm hinzufügen*
+
+Beim ersten Stempeln fragt das Handy, ob die App den Standort verwenden darf → **Erlauben** tippen.
+
 ## Damit Mitarbeiter von unterwegs stempeln können
 
 Die App muss auf einem Server laufen, der aus dem Internet erreichbar ist, z. B.:
